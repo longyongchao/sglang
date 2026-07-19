@@ -64,9 +64,6 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if server_args.speculative_algorithm is not None:
         server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
 
-    if server_args.speculative_algorithm == "DSPARK":
-        _handle_dspark(server_args)
-
     # Removal notice for the retired env var; raw os.getenv on purpose -- the
     # Envs descriptor is gone. Drop this check after one release.
     if os.getenv("SGLANG_ENABLE_SPEC_V2") is not None:
@@ -243,6 +240,67 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         logger.warning(
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
         )
+
+
+def _handle_dspark(server_args: ServerArgs) -> None:
+    """Validate DSpark arguments before worker construction."""
+    if server_args.enable_dp_attention:
+        raise ValueError("DSPARK currently does not support dp attention.")
+    if server_args.pp_size != 1:
+        raise ValueError("DSPARK currently only supports pp_size == 1.")
+    if server_args.speculative_draft_model_path is None:
+        raise ValueError(
+            "DSPARK speculative decoding requires setting "
+            "--speculative-draft-model-path."
+        )
+
+    if server_args.speculative_num_steps not in (None, 1):
+        logger.warning(
+            "DSPARK uses a fixed block; overriding speculative_num_steps=%s to 1.",
+            server_args.speculative_num_steps,
+        )
+    server_args.speculative_num_steps = 1
+    if server_args.speculative_eagle_topk not in (None, 1):
+        logger.warning(
+            "DSPARK uses one proposal chain; overriding speculative_eagle_topk=%s to 1.",
+            server_args.speculative_eagle_topk,
+        )
+    server_args.speculative_eagle_topk = 1
+
+    block_size = server_args.speculative_dspark_block_size
+    draft_tokens = server_args.speculative_num_draft_tokens
+    if block_size is not None and int(block_size) <= 1:
+        raise ValueError(
+            "DSPARK block size must be >= 2 (gamma + 1), "
+            f"got {block_size}."
+        )
+    if draft_tokens is not None and int(draft_tokens) <= 1:
+        raise ValueError(
+            "DSPARK speculative_num_draft_tokens must be >= 2 (gamma + 1), "
+            f"got {draft_tokens}."
+        )
+    if block_size is not None and draft_tokens is not None and int(block_size) != int(draft_tokens):
+        raise ValueError(
+            "DSPARK block size and speculative_num_draft_tokens must match: "
+            f"block_size={block_size}, num_draft_tokens={draft_tokens}."
+        )
+    if block_size is not None:
+        server_args.speculative_num_draft_tokens = int(block_size)
+    elif draft_tokens is not None:
+        server_args.speculative_dspark_block_size = int(draft_tokens)
+    else:
+        server_args.speculative_num_draft_tokens = 8
+        server_args.speculative_dspark_block_size = 8
+        logger.warning("DSPARK block size is not set; defaulting to 8.")
+
+    if server_args.speculative_dspark_confidence_mode == "scheduled":
+        raise NotImplementedError(
+            "DSPARK confidence scheduling is not wired in this v0.5.14 port yet. "
+            "Use confidence mode 'none' or 'static' after the worker is enabled."
+        )
+    if server_args.enable_mixed_chunk:
+        server_args.enable_mixed_chunk = False
+        logger.warning("Mixed chunked prefill is disabled for DSPARK.")
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
