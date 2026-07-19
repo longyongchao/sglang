@@ -29,7 +29,7 @@ import sys
 import threading
 import zlib
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import psutil
 import setproctitle
@@ -49,12 +49,6 @@ from sglang.srt.managers.io_struct import (
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
     TokenizerWorkerRegistrationReq,
-    async_sock_recv,
-    async_sock_send,
-    sock_recv,
-    sock_send,
-    unwrap_from_pickle,
-    wrap_as_pickle,
 )
 from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
@@ -103,7 +97,7 @@ class SocketMapping:
 
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=is_tokenizer)
-        sock_send(self._mapping[ipc_name], output)
+        self._mapping[ipc_name].send_pyobj(output)
 
 
 def _extract_field_by_index(
@@ -124,29 +118,17 @@ def _extract_field_by_index(
     if field is None:
         return None
 
-    should_wrap_result = field_name in ("customized_info", "time_stats")
-    if should_wrap_result:
-        field = unwrap_from_pickle(field)
-        if field is None:
-            return None
-
     if isinstance(field, dict):
         new_field = {}
         for k, v in field.items():
-            if len(v) > index:
-                new_field[k] = [v[index]] if should_wrap_result else v[index]
-            else:
-                new_field[k] = [None] if should_wrap_result else None
-        if should_wrap_result:
-            return wrap_as_pickle(new_field) if new_field else None
+            new_field[k] = v[index] if len(v) > index else None
         return new_field
 
     if check_length:
         if len(field) <= index:
             return None
 
-    new_field = [field[index]]
-    return wrap_as_pickle(new_field) if should_wrap_result else new_field
+    return [field[index]]
 
 
 def _handle_output_by_index(output, i):
@@ -231,12 +213,6 @@ def _handle_output_by_index(output, i):
             ),
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
-            ),
-            output_token_sampling_mask=_extract_field_by_index(
-                output, "output_token_sampling_mask", i, check_length=False
-            ),
-            output_token_sampling_logprobs=_extract_field_by_index(
-                output, "output_token_sampling_logprobs", i, check_length=False
             ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
@@ -340,12 +316,6 @@ def _handle_output_by_index(output, i):
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
             ),
-            output_token_sampling_mask=_extract_field_by_index(
-                output, "output_token_sampling_mask", i, check_length=False
-            ),
-            output_token_sampling_logprobs=_extract_field_by_index(
-                output, "output_token_sampling_logprobs", i, check_length=False
-            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -381,31 +351,29 @@ class MultiHttpWorkerDetokenizerMixin:
     def multi_http_worker_event_loop(self: DetokenizerManager):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
-        # Watchdog wiring mirrors DetokenizerManager.event_loop: the watchdog is
-        # paused while waiting for input and fed once per processed message.
         while True:
-            with self.soft_watchdog.disable():
-                recv_obj = sock_recv(self.recv_from_scheduler)
+            recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
-            if output is not None:
-                # Fan out the output back to the originating tokenizer worker(s).
-                # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
-                # forward either batched or single requests, so handle both shapes.
-                if isinstance(recv_obj, BaseBatchReq):
-                    for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                        new_output = _handle_output_by_index(output, i)
-                        self.socket_mapping.send_output(
-                            ipc_name, new_output, is_tokenizer=True
-                        )
-                elif isinstance(recv_obj, BaseReq):
+            if output is None:
+                continue
+
+            # Fan out the output back to the originating tokenizer worker(s).
+            # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
+            # forward either batched or single requests, so handle both shapes.
+            if isinstance(recv_obj, BaseBatchReq):
+                for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
+                    new_output = _handle_output_by_index(output, i)
                     self.socket_mapping.send_output(
-                        recv_obj.http_worker_ipc, output, is_tokenizer=True
+                        ipc_name, new_output, is_tokenizer=True
                     )
-                else:
-                    raise ValueError(
-                        f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
-                    )
-            self.soft_watchdog.feed()
+            elif isinstance(recv_obj, BaseReq):
+                self.socket_mapping.send_output(
+                    recv_obj.http_worker_ipc, output, is_tokenizer=True
+                )
+            else:
+                raise ValueError(
+                    f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
+                )
 
 
 class MultiTokenizerRouter:
@@ -481,7 +449,7 @@ class MultiTokenizerRouter:
     async def router_worker_obj(self):
         """Forward path: workers → scheduler, with pause/continue broadcast."""
         while True:
-            recv_obj = await async_sock_recv(self.receive_from_worker)
+            recv_obj = await self.receive_from_worker.recv_pyobj()
 
             if isinstance(recv_obj, TokenizerWorkerRegistrationReq):
                 if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
@@ -506,15 +474,15 @@ class MultiTokenizerRouter:
                     isinstance(recv_obj, PauseGenerationReqInput)
                     and recv_obj.mode == "abort"
                 ):
-                    await async_sock_send(self.send_to_scheduler, recv_obj)
+                    await self.send_to_scheduler.send_pyobj(recv_obj)
                 continue
 
-            await async_sock_send(self.send_to_scheduler, recv_obj)
+            await self.send_to_scheduler.send_pyobj(recv_obj)
 
     async def handle_loop(self):
         """Backward path: detokenizer → route results to correct worker."""
         while True:
-            recv_obj = await async_sock_recv(self.recv_from_detokenizer)
+            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
@@ -555,7 +523,7 @@ class MultiDetokenizerRouter:
 
     def event_loop(self):
         while True:
-            recv_obj = sock_recv(self.recv_from_scheduler)
+            recv_obj = self.recv_from_scheduler.recv_pyobj()
 
             # FreezeGCReq must freeze every detokenizer process.
             if isinstance(recv_obj, FreezeGCReq):
@@ -631,24 +599,16 @@ class TokenizerWorker(TokenizerManager):
         port_args: PortArgs,
     ):
         setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
-        import torch
-
-        torch.set_num_threads(1)
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
-        server_args.override(
-            "tokenizer_worker.suppress_bootstrap", disaggregation_mode="null"
-        )
+        server_args.disaggregation_mode = "null"
         super().__init__(server_args, port_args)
 
         self.worker_id = os.getpid()
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
         # For PD disaggregtion
-        self.server_args.override(
-            "tokenizer_worker.restore_disaggregation_mode",
-            disaggregation_mode=disaggregation_mode,
-        )
+        self.server_args.disaggregation_mode = disaggregation_mode
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -658,7 +618,7 @@ class TokenizerWorker(TokenizerManager):
 
         # Register this worker with the router for pause/continue broadcasting
         reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
-        self._dispatch_to_scheduler(reg)
+        self.send_to_scheduler.send_pyobj(reg)
 
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
@@ -676,7 +636,7 @@ class TokenizerWorker(TokenizerManager):
         self._pause_continue_future = loop.create_future()
         # Send to router which will broadcast to all workers
         # (router also handles forwarding to scheduler for non-abort modes)
-        self._dispatch_to_scheduler(obj)
+        self.send_to_scheduler.send_pyobj(obj)
         await self._pause_continue_future
 
         if obj.mode == "abort":
@@ -691,7 +651,7 @@ class TokenizerWorker(TokenizerManager):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
-        self._dispatch_to_scheduler(obj)
+        self.send_to_scheduler.send_pyobj(obj)
         await self._pause_continue_future
 
     def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
@@ -713,18 +673,14 @@ class TokenizerWorker(TokenizerManager):
             self._pause_continue_future.set_result(True)
             self._pause_continue_future = None
 
+    def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
 
-def get_tokenizer_worker_class(server_args: ServerArgs) -> Type[TokenizerWorker]:
-    worker_class = server_args.get_tokenizer_worker_class()
-    if not isinstance(worker_class, type) or not issubclass(
-        worker_class, TokenizerWorker
-    ):
-        raise TypeError(
-            "ServerArgs.get_tokenizer_worker_class() must return a TokenizerWorker "
-            f"subclass, got {worker_class!r}"
-        )
-
-    return worker_class
+        if isinstance(req, BaseReq):
+            req.http_worker_ipc = self.tokenizer_ipc_name
+        elif isinstance(req, BaseBatchReq):
+            req.http_worker_ipcs = [self.tokenizer_ipc_name] * len(req.rids)
+        else:
+            raise ValueError(f"Unknown req type: {type(req)}")
 
 
 async def print_exception_wrapper(func):
@@ -746,7 +702,9 @@ async def print_exception_wrapper(func):
 
 
 def get_main_process_id() -> int:
-    """Get the main process ID."""
+    """
+    Get the main process ID.
+    """
     return multiprocessing.current_process()._parent_pid
 
 
@@ -797,9 +755,6 @@ def write_data_for_multi_tokenizer(
 
 
 class SenderWrapper:
-    """Stamps each outgoing request with this worker's tokenizer IPC name so the
-    scheduler can route responses back in multi-tokenizer mode."""
-
     def __init__(self, port_args: PortArgs, send_to_scheduler: zmq.Socket):
         self.port_args = port_args
         self.send_to_scheduler = send_to_scheduler
