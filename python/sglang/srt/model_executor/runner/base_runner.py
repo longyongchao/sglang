@@ -197,6 +197,10 @@ class BaseRunner(ABC):
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
+        self.enable_pdmux = getattr(model_runner.server_args, "enable_pdmux", False)
+        self.enable_return_hidden_states = (
+            model_runner.server_args.enable_return_hidden_states
+        )
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.tbo_plugin = TboCudaGraphRunnerPlugin()

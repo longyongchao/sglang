@@ -855,7 +855,7 @@ class Scheduler(
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
-        if model_runner.token_to_kv_pool.post_capture_active:
+        if getattr(model_runner.token_to_kv_pool, "post_capture_active", False):
             model_runner.post_capture_resize_kv_pool()
 
         # Dispatch the model worker
@@ -3004,7 +3004,7 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
-        if self.tp_worker.model_runner.prefill_aware_swa:
+        if getattr(self.tp_worker.model_runner, "prefill_aware_swa", False):
             for req in can_run_list:
                 req.swa_evict_floor = req.extend_range.end
 

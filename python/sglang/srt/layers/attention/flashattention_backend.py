@@ -320,8 +320,14 @@ class FlashAttentionBackend(AttentionBackend):
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
-                get_scheduler_metadata,
             )
+
+            # Older sgl_kernel wheels don't ship get_scheduler_metadata; the
+            # backend already handles a None hook (skips FA3 metadata precompute).
+            try:
+                from sgl_kernel.flash_attn import get_scheduler_metadata
+            except ImportError:
+                get_scheduler_metadata = None
 
             self._get_scheduler_metadata = get_scheduler_metadata
         elif self.fa_impl_ver == 4:

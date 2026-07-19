@@ -17,14 +17,30 @@ DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
 def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
-    if out is None:
-        return kernel(*args, **kwargs)
-    try:
-        return kernel(*args, **kwargs, out=out)
-    except TypeError as exc:
-        if "unexpected keyword argument 'out'" not in str(exc):
-            raise
-        return kernel(*args, **kwargs)
+    # Older kernel builds (e.g. the sgl-kernel wheel fallback) may not accept
+    # newer optional kwargs. Drop any that are unset/disabled and rejected.
+    _droppable = ("out", "only_qv", "sinks")
+    if out is not None:
+        kwargs = {**kwargs, "out": out}
+    for _ in range(len(_droppable) + 1):
+        try:
+            return kernel(*args, **kwargs)
+        except TypeError as exc:
+            msg = str(exc)
+            dropped = False
+            for name in _droppable:
+                if f"unexpected keyword argument '{name}'" not in msg:
+                    continue
+                value = kwargs.get(name)
+                # `out` may safely be dropped (result is returned instead);
+                # flags are only droppable when unset/disabled.
+                if name == "out" or value is None or value is False:
+                    kwargs = {k: v for k, v in kwargs.items() if k != name}
+                    dropped = True
+                    break
+            if not dropped:
+                raise
+    raise RuntimeError("unreachable")
 
 
 @cache_once

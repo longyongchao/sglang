@@ -903,12 +903,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.init_attention_backend()
 
+    def decode_num_tokens_per_bs(
+        self, *, num_draft_tokens: Optional[int] = None
+    ) -> int:
+        """Logits rows per decode batch slot."""
+        if self.spec_algorithm.is_speculative():
+            if num_draft_tokens is None:
+                num_draft_tokens = self.server_args.speculative_num_draft_tokens
+            return self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                num_draft_tokens, self.is_draft_worker
+            )
+        from sglang.srt.dllm.config import DllmConfig
+
+        dllm_config = DllmConfig.from_server_args(self.server_args)
+        return dllm_config.block_size if dllm_config is not None else 1
+
+    def max_decode_logits_rows(self) -> int:
+        """Rows the shared logits buffer needs."""
+        num_tokens_per_bs = self.decode_num_tokens_per_bs()
+        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
+        return max(capture_bs) * num_tokens_per_bs
+
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs. Requires init_attention_backends() to have run.
 
         Spec draft runners pass capture_decode_cuda_graph=False
         because they capture their own decode-style graphs separately.
         """
+
+        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+
+        self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
 
         # The eager (no-cuda-graph) phase runner, built AFTER the attention
         # backend so its __init__ can warm up kernels (run-once) and allocate the

@@ -93,8 +93,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
         max_bs: int,
         max_num_token: int,
         hidden_size: int,
-        vocab_size: int,
-        dtype: torch.dtype,
+        vocab_size: Optional[int] = None,
+        next_token_logits_buffer: Optional[torch.Tensor] = None,
+        dtype: torch.dtype = torch.bfloat16,
         dp_size: int,
         pp_size: int,
         is_encoder_decoder: bool,
@@ -127,10 +128,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
                 dtype=torch.bool,
             )
-            next_token_logits_buffer = torch.zeros(
-                (max_num_token, vocab_size),
-                dtype=torch.float,
-            )
+            if next_token_logits_buffer is None:
+                assert vocab_size is not None
+                next_token_logits_buffer = torch.zeros(
+                    (max_num_token, vocab_size),
+                    dtype=torch.float,
+                )
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
                 if enable_mamba_track
