@@ -506,4 +506,6 @@ class Qwen3DSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel]
+# DSpark checkpoints produced by SpecForge use DSparkDraftModel as their
+# architecture name; Qwen3DSparkModel is retained for newer renamed configs.
+EntryClass = [DSparkDraftModel, Qwen3DSparkModel]
