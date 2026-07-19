@@ -1481,6 +1481,19 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dspark_block_size: A[
+        Optional[int],
+        "DSPARK only. Draft block size (gamma + 1 verify window).",
+    ] = None
+    speculative_dspark_confidence_mode: A[
+        str,
+        Arg(
+            help="DSPARK confidence mode: none disables the optional confidence head, "
+            "static computes it without dynamic scheduling, scheduled enables "
+            "confidence-based scheduling.",
+            choices=["none", "static", "scheduled"],
+        ),
+    ] = "none"
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

@@ -64,6 +64,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if server_args.speculative_algorithm is not None:
         server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
 
+    if server_args.speculative_algorithm == "DSPARK":
+        _handle_dspark(server_args)
+
     # Removal notice for the retired env var; raw os.getenv on purpose -- the
     # Envs descriptor is gone. Drop this check after one release.
     if os.getenv("SGLANG_ENABLE_SPEC_V2") is not None:
