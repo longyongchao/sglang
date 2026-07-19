@@ -1726,6 +1726,26 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
     allow_quant_error: bool = False
 
 
+# Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
+# sglang.srt.utils.weight_checker. Not array_like: the payload is read by field
+# name and re-serialized to JSON, so it must stay a {field: value} map.
+class ParallelismInfo(msgspec.Struct, kw_only=True):
+    tp_rank: int
+    tp_size: int
+    dp_rank: int
+    dp_size: int
+    pp_rank: int
+    pp_size: int
+    rank: int
+    size: int
+
+
+class ChecksumInfo(msgspec.Struct, kw_only=True):
+    checksums: Dict[str, str]
+    per_gpu_checksum: str
+    parallelism_info: ParallelismInfo
+
+
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
@@ -1804,6 +1824,11 @@ class ProfileReq(BaseReq, kw_only=True):
     profile_prefix: Optional[str] = None
     # Only profile these stages and ignore others
     profile_stages: Optional[List[str]] = None
+
+
+# HTTP-facing alias: the legacy /start_profile body type. All fields of
+# ProfileReq are defaulted, so the request-side surface is identical.
+ProfileReqInput = ProfileReq
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):

@@ -561,3 +561,17 @@ def eagle_sample(
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
     return predict, num_correct_drafts + 1, accept_index
+
+
+def get_draft_recurrent_hidden_state_spec(model_runner):
+    """Return hidden_states width/dtype carried between draft decode steps."""
+    if model_runner.spec_algorithm.is_standalone():
+        return None, None
+    return model_runner.model_config.spec_hidden_size, model_runner.model_config.dtype
+
+
+def eagle_prepare_for_decode(batch):
+    """Stateless dispatcher target for eagle/ngram decode prep (see
+    spec_utils.spec_prepare_for_decode). Delegates to the draft input's
+    stateful prepare_for_decode, matching this branch's eagle_info_v2 API."""
+    batch.spec_info.prepare_for_decode(batch)

@@ -38,6 +38,7 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import msgspec
 import re
 from array import array
 from concurrent.futures import Future
@@ -2937,3 +2938,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
         )
+
+
+class NextBatchPlan(msgspec.Struct):
+    batch_to_run: Optional[ScheduleBatch]
+    running_batch: ScheduleBatch

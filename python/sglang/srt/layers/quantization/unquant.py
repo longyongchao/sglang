@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -821,3 +822,50 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         return self.forward_cuda(*args, **kwargs)
 
     forward_native = forward_cpu
+
+
+class Bf16GemmBackend(Enum):
+    AUTO = "auto"
+    CUTEDSL = "cutedsl"
+
+    def is_auto(self) -> bool:
+        return self == Bf16GemmBackend.AUTO
+
+    def is_cutedsl(self) -> bool:
+        return self == Bf16GemmBackend.CUTEDSL
+
+
+_BF16_GEMM_BACKEND: Optional["Bf16GemmBackend"] = None
+_cutedsl_bf16_gemm = None
+_use_cutedsl_bf16_gemm = None
+
+
+def initialize_bf16_gemm_config(server_args) -> None:
+    global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
+
+    backend = Bf16GemmBackend(getattr(server_args, "bf16_gemm_backend", "auto"))
+
+    if backend.is_cutedsl():
+        from sglang.srt.utils import is_sm100_supported
+
+        if not is_sm100_supported():
+            raise ValueError(
+                "--bf16-gemm-backend cutedsl requires SM100/SM103 (Blackwell)"
+            )
+
+        from sglang.jit_kernel.cutedsl_bf16_gemm import (
+            cutedsl_bf16_gemm,
+            use_cutedsl_bf16_gemm,
+        )
+
+        _cutedsl_bf16_gemm = cutedsl_bf16_gemm
+        _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
+
+    _BF16_GEMM_BACKEND = backend
+
+
+def get_bf16_gemm_backend() -> Bf16GemmBackend:
+    global _BF16_GEMM_BACKEND
+    if _BF16_GEMM_BACKEND is None:
+        _BF16_GEMM_BACKEND = Bf16GemmBackend.AUTO
+    return _BF16_GEMM_BACKEND
