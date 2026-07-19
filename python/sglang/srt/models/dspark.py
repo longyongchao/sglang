@@ -262,13 +262,16 @@ class RNNHead(VanillaMarkov):
 
 
 def build_markov_head(config) -> Optional[nn.Module]:
-    markov_rank = int(getattr(config, "markov_rank", 0))
+    # markov_rank / markov_head_type may live in the nested dspark_config dict
+    # (SpecForge checkpoints) rather than as top-level HF config attributes.
+    parsed = parse_dspark_draft_config(draft_hf_config=config)
+    markov_rank = int(parsed.markov_rank or 0)
     if markov_rank <= 0:
         raise ValueError(
             "DSpark requires markov_rank > 0 (the Markov head is the core of the "
             f"semi-AR draft); got markov_rank={markov_rank}."
         )
-    markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
+    markov_head_type = str(parsed.markov_head_type or "vanilla").lower()
     vocab_size = int(config.vocab_size)
     hidden_size = int(config.hidden_size)
     if markov_head_type == "vanilla":
@@ -331,14 +334,27 @@ class DSparkConfidenceHead(nn.Module):
 def build_confidence_head(config) -> Optional[nn.Module]:
     if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
         return None
-    if not hasattr(config, "enable_confidence_head"):
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        _get_dspark_config,
+    )
+
+    nested = _get_dspark_config(config)
+    parsed = parse_dspark_draft_config(draft_hf_config=config)
+    if "enable_confidence_head" not in nested and not hasattr(
+        config, "enable_confidence_head"
+    ):
         logger.warning(
             "DSpark draft config has no enable_confidence_head field; treating the "
             "confidence head as enabled."
         )
     hidden_size = int(config.hidden_size)
-    markov_rank = int(getattr(config, "markov_rank", 0))
-    with_markov = bool(getattr(config, "confidence_head_with_markov", markov_rank > 0))
+    markov_rank = int(parsed.markov_rank or 0)
+    with_markov = bool(
+        nested.get(
+            "confidence_head_with_markov",
+            getattr(config, "confidence_head_with_markov", markov_rank > 0),
+        )
+    )
     if with_markov and markov_rank <= 0:
         raise ValueError(
             "DSpark confidence_head_with_markov requires markov_rank > 0, "
