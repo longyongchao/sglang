@@ -115,6 +115,7 @@ else:
         build_tree_kernel_efficient,
         reconstruct_indices_from_tree_mask,
         segment_packbits,
+        tree_speculative_sampling_eagle,
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
     )
@@ -205,6 +206,7 @@ else:
         "transfer_kv_all_layer_mla",
         "transfer_kv_per_layer",
         "transfer_kv_per_layer_mla",
+        "tree_speculative_sampling_eagle",
         "tree_speculative_sampling_target_only",
         "verify_tree_greedy",
         "weak_ref_tensor",

@@ -251,6 +251,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * From csrc/speculative
    */
   m.def(
+      "tree_speculative_sampling_eagle(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "Tensor uniform_samples, Tensor uniform_samples_for_final_sampling, Tensor target_probs, "
+      "Tensor rejected_probs) -> ()");
+  m.impl("tree_speculative_sampling_eagle", torch::kCUDA, &tree_speculative_sampling_eagle);
+
+  m.def(
       "tree_speculative_sampling_target_only(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
       "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
       "Tensor uniform_samples, Tensor uniform_samples_for_final_sampling, Tensor target_probs, Tensor draft_probs, "

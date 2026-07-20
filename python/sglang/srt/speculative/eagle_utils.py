@@ -487,50 +487,60 @@ def eagle_sample(
         )
         maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = (
-            verify_input.draft_probs
-            if use_rejection_sampling
-            else torch.zeros_like(target_probs)
-        )
-        # Defense-in-depth behind the spec_hook startup allowlist: validate the
-        # actual kernel inputs (catches draft_probs plumbing regressions or a
-        # startup guard bypassed by a worker subclass) before the Triton kernel.
-        if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-        ):
-            raise ValueError(
-                "Rejection sampling requires a target-vocab draft proposal "
-                "distribution; the current speculative algorithm/draft worker "
-                "does not produce one (draft_probs missing or vocab-mismatched)."
-            )
-
-        # coins for rejection sampling
+        # One coin is consumed per tree node and one more for the bonus token.
         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-        # coins for final sampling
         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
+        if verify_input.use_eagle3_rejection_sampling:
+            from sgl_kernel import tree_speculative_sampling_eagle
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
-        sampling_fn(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=verify_input.retrieve_index,
-            retrive_next_token=verify_input.retrieve_next_token,
-            retrive_next_sibling=verify_input.retrieve_next_sibling,
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=get_global_server_args().speculative_accept_threshold_single,
-            threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
-            deterministic=True,
-        )
+            tree_speculative_sampling_eagle(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=candidates,
+                retrive_index=verify_input.retrieve_index,
+                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_sibling=verify_input.retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                rejected_probs=torch.zeros_like(target_probs),
+            )
+        else:
+            draft_probs = (
+                verify_input.draft_probs
+                if use_rejection_sampling
+                else torch.zeros_like(target_probs)
+            )
+            if use_rejection_sampling and (
+                draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+            ):
+                raise ValueError(
+                    "Rejection sampling requires a target-vocab draft proposal "
+                    "distribution; the current speculative algorithm/draft worker "
+                    "does not produce one (draft_probs missing or vocab-mismatched)."
+                )
+            sampling_fn = (
+                chain_speculative_sampling_triton
+                if use_rejection_sampling
+                else tree_speculative_sampling_target_only
+            )
+            sampling_fn(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=candidates,
+                retrive_index=verify_input.retrieve_index,
+                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_sibling=verify_input.retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=get_global_server_args().speculative_accept_threshold_single,
+                threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+                deterministic=True,
+            )
 
         # Sync sampling results across TP ranks: different GPUs may
         # produce slightly different target_probs due to floating-point

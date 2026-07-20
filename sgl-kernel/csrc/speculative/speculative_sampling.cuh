@@ -174,6 +174,116 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
 }
 
 template <typename DType, typename IdType, typename IdType2>
+__global__ void TreeSpeculativeSamplingEagleKernel(
+    IdType* predicts,
+    IdType* accept_index,
+    IdType* accept_token_num,
+    IdType2* candidates,
+    IdType2* retrive_index,
+    IdType2* retrive_next_token,
+    IdType2* retrive_next_sibling,
+    DType* uniform_samples,
+    DType* uniform_samples_for_final_sampling,
+    DType* target_probs,
+    DType* rejected_probs,
+    uint32_t num_speculative_tokens,
+    uint32_t num_draft_tokens,
+    uint32_t d) {
+  if (threadIdx.x != 0) return;
+  const uint32_t bx = blockIdx.x;
+  const uint32_t base = bx * num_draft_tokens;
+  IdType2 accepted_retrieve_idx = retrive_index[base];
+  IdType2 current_node = 0;
+  uint32_t accepted = 0;
+  accept_index[bx * num_speculative_tokens] = accepted_retrieve_idx;
+
+  for (uint32_t depth = 1; depth < num_speculative_tokens; ++depth) {
+    IdType2 node = retrive_next_token[base + current_node];
+    DType remaining_mass = DType(1);
+    bool found = false;
+    while (node != static_cast<IdType2>(-1)) {
+      const IdType2 token = candidates[base + node];
+      const uint32_t row = base + node;
+      const DType p = target_probs[row * d + token];
+      const DType coin = uniform_samples[row];
+      if (remaining_mass > DType(0) && coin * remaining_mass <= p) {
+        predicts[accepted_retrieve_idx] = token;
+        ++accepted;
+        const IdType2 retrieve_idx = retrive_index[row];
+        accept_index[bx * num_speculative_tokens + accepted] = retrieve_idx;
+        accepted_retrieve_idx = retrieve_idx;
+        current_node = node;
+        found = true;
+        break;
+      }
+      rejected_probs[row * d + token] = p;
+      remaining_mass = max(remaining_mass - p, DType(0));
+      node = retrive_next_sibling[row];
+    }
+    if (!found) break;
+  }
+
+  accept_token_num[bx] = accepted;
+  const uint32_t row = base + current_node;
+  const DType coin = uniform_samples_for_final_sampling[bx];
+  DType mass = DType(0);
+  int32_t last_valid = -1;
+  for (uint32_t i = 0; i < d; ++i) {
+    const DType residual = max(target_probs[row * d + i] - rejected_probs[row * d + i], DType(0));
+    if (residual > DType(0)) last_valid = static_cast<int32_t>(i);
+    mass += residual;
+  }
+  const DType threshold = coin * mass;
+  DType cumulative = DType(0);
+  int32_t sampled = last_valid >= 0 ? last_valid : static_cast<int32_t>(d - 1);
+  for (uint32_t i = 0; i < d; ++i) {
+    const DType residual = max(target_probs[row * d + i] - rejected_probs[row * d + i], DType(0));
+    cumulative += residual;
+    if (cumulative >= threshold && residual > DType(0)) {
+      sampled = static_cast<int32_t>(i);
+      break;
+    }
+  }
+  predicts[accepted_retrieve_idx] = sampled;
+}
+
+template <typename DType, typename IdType, typename IdType2>
+cudaError_t TreeSpeculativeSamplingEagle(
+    IdType* predicts,
+    IdType* output_token_ids,
+    IdType* output_accepted_token_num,
+    IdType2* candidates,
+    IdType2* retrive_index,
+    IdType2* retrive_next_token,
+    IdType2* retrive_next_sibling,
+    DType* uniform_samples,
+    DType* uniform_samples_for_final_sampling,
+    DType* target_probs,
+    DType* rejected_probs,
+    uint32_t batch_size,
+    uint32_t num_speculative_tokens,
+    uint32_t num_draft_tokens,
+    uint32_t d,
+    cudaStream_t stream = 0) {
+  TreeSpeculativeSamplingEagleKernel<<<batch_size, 1, 0, stream>>>(
+      predicts,
+      output_token_ids,
+      output_accepted_token_num,
+      candidates,
+      retrive_index,
+      retrive_next_token,
+      retrive_next_sibling,
+      uniform_samples,
+      uniform_samples_for_final_sampling,
+      target_probs,
+      rejected_probs,
+      num_speculative_tokens,
+      num_draft_tokens,
+      d);
+  return cudaGetLastError();
+}
+
+template <typename DType, typename IdType, typename IdType2>
 cudaError_t TreeSpeculativeSamplingTargetOnly(
     IdType* predicts,                   // mutable
     IdType* output_token_ids,           // mutable

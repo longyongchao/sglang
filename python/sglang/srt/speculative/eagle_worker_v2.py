@@ -152,12 +152,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Args for easy access
         self.device = server_args.device
         self.topk = server_args.speculative_eagle_topk
-        if self.server_args.speculative_use_rejection_sampling:
-            assert self.topk == 1, "Chain speculative sampling supports only topk=1"
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
+        )
+        self.use_eagle3_rejection_sampling = (
+            server_args.speculative_use_rejection_sampling
+            and self.speculative_algorithm.is_eagle3()
+        )
+        self.use_classic_rejection_sampling = (
+            server_args.speculative_use_rejection_sampling
+            and not self.use_eagle3_rejection_sampling
         )
 
         # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
@@ -229,21 +235,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
+        self._validate_hot_token_id()
 
-        if self.server_args.speculative_use_rejection_sampling:
+        if self.use_eagle3_rejection_sampling and self.hot_token_id is None:
+            draft_vocab_size = self.draft_runner.model_config.vocab_size
+            target_vocab_size = self.target_worker.model_config.vocab_size
+            if draft_vocab_size != target_vocab_size:
+                raise ValueError(
+                    "Official EAGLE3 rejection sampling requires a d2t token map "
+                    "when the draft head vocabulary is reduced."
+                )
+        if self.use_classic_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
             draft_vocab_size = (
                 self.hot_token_id.shape[0]
                 if self.hot_token_id is not None
                 else target_vocab_size
             )
-            # FIXME: support reduced (hot) draft vocab by scattering draft probs
-            # into the target vocab via the d2t map before the sampling kernel.
             if draft_vocab_size != target_vocab_size:
                 raise ValueError(
-                    "--speculative-use-rejection-sampling requires the draft and "
-                    f"target to share one vocab, but the draft vocab "
-                    f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
+                    "Classic rejection sampling requires equal draft and target vocabularies."
                 )
 
     def init_attention_backends(self):
@@ -298,6 +309,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._topk1_score_indices_prealloc = torch.arange(
             num_steps, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
+
+    def _validate_hot_token_id(self):
+        if self.hot_token_id is None:
+            return
+        mapping = self.hot_token_id
+        draft_vocab_size = self.draft_runner.model_config.vocab_size
+        target_vocab_size = self.target_worker.model_config.vocab_size
+        if mapping.ndim != 1 or not mapping.is_contiguous() or mapping.dtype != torch.int64:
+            raise ValueError("d2t token map must be contiguous one-dimensional torch.int64")
+        if mapping.numel() != draft_vocab_size:
+            raise ValueError(
+                f"d2t token map length ({mapping.numel()}) must equal draft vocabulary ({draft_vocab_size})"
+            )
+        if torch.any(mapping < 0) or torch.any(mapping >= target_vocab_size):
+            raise ValueError("d2t token map contains a token outside the target vocabulary")
+        if torch.unique(mapping).numel() != mapping.numel():
+            raise ValueError("d2t token map must contain globally unique target token ids")
 
     def init_token_map(self):
         # Load hot token ids
@@ -570,6 +598,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             seq_lens_sum=None,
             seq_lens_cpu=None,
             draft_probs=draft_probs,
+            use_eagle3_rejection_sampling=self.use_eagle3_rejection_sampling,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -598,7 +627,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
-        if self.server_args.speculative_use_rejection_sampling:
+        if self.use_classic_rejection_sampling:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
         # Forward multiple steps
@@ -649,14 +678,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if self.server_args.speculative_use_rejection_sampling:
+            if self.use_classic_rejection_sampling:
                 probs = renorm_draft_probs(
                     logits_output.next_token_logits,
                     forward_batch.sampling_info,
-                    self.server_args.speculative_use_rejection_sampling,
+                    True,
                 )
                 topk_p, topk_index = fast_sample(probs, num_samples=1)
                 draft_probs_list.append(probs)
+            elif self.use_eagle3_rejection_sampling:
+                probs = renorm_draft_probs(
+                    logits_output.next_token_logits,
+                    forward_batch.sampling_info,
+                    True,
+                )
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             elif self.topk == 1 and not _is_hip:
                 topk_index = torch.argmax(
                     logits_output.next_token_logits, dim=-1, keepdim=True
@@ -700,7 +736,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             parent_list = self._topk1_parents_prealloc[:bs]
             draft_probs = (
                 torch.stack(draft_probs_list, dim=1)
-                if self.server_args.speculative_use_rejection_sampling
+                if self.use_classic_rejection_sampling
                 else None
             )
             return parent_list, top_scores_index, draft_tokens, draft_probs
@@ -711,7 +747,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)
-            if self.server_args.speculative_use_rejection_sampling
+            if self.use_classic_rejection_sampling
             else None
         )
         return parent_list, top_scores_index, draft_tokens, draft_probs
@@ -786,20 +822,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         # Assemble the next-iter draft spec_info from the extend output.
-        use_rejection_sampling = self.server_args.speculative_use_rejection_sampling
         probs = renorm_draft_probs(
             logits_output.next_token_logits,
             batch.sampling_info,
-            use_rejection_sampling,
+            self.server_args.speculative_use_rejection_sampling,
         )
-        if use_rejection_sampling:
+        if self.use_classic_rejection_sampling:
             topk_p, topk_index = fast_sample(probs, num_samples=1)
+            draft_probs = probs
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            draft_probs = None
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
-            draft_probs=probs if use_rejection_sampling else None,
+            draft_probs=draft_probs,
             hidden_states=logits_output.hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,

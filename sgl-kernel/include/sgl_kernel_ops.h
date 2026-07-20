@@ -433,6 +433,19 @@ void cutlass_w4a8_moe_mm(
 /*
  * From csrc/speculative
  */
+void tree_speculative_sampling_eagle(
+    at::Tensor predicts,
+    at::Tensor accept_index,
+    at::Tensor accept_token_num,
+    at::Tensor candidates,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    at::Tensor uniform_samples,
+    at::Tensor uniform_samples_for_final_sampling,
+    at::Tensor target_probs,
+    at::Tensor rejected_probs);
+
 void tree_speculative_sampling_target_only(
     at::Tensor predicts,          // mutable
     at::Tensor accept_index,      // mutable

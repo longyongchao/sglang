@@ -149,3 +149,94 @@ void tree_speculative_sampling_target_only(
       status == cudaSuccess,
       "TreeSpeculativeSamplingTargetOnly failed with error code " + std::string(cudaGetErrorString(status)));
 }
+
+void tree_speculative_sampling_eagle(
+    at::Tensor predicts,
+    at::Tensor accept_index,
+    at::Tensor accept_token_num,
+    at::Tensor candidates,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    at::Tensor uniform_samples,
+    at::Tensor uniform_samples_for_final_sampling,
+    at::Tensor target_probs,
+    at::Tensor rejected_probs) {
+  CHECK_INPUT(candidates);
+  CHECK_INPUT(retrive_index);
+  CHECK_INPUT(retrive_next_token);
+  CHECK_INPUT(retrive_next_sibling);
+  CHECK_INPUT(uniform_samples);
+  CHECK_INPUT(uniform_samples_for_final_sampling);
+  CHECK_INPUT(target_probs);
+  CHECK_INPUT(rejected_probs);
+  auto device = target_probs.device();
+  CHECK_EQ(candidates.device(), device);
+  CHECK_EQ(retrive_index.device(), device);
+  CHECK_EQ(retrive_next_token.device(), device);
+  CHECK_EQ(retrive_next_sibling.device(), device);
+  CHECK_EQ(uniform_samples.device(), device);
+  CHECK_EQ(uniform_samples_for_final_sampling.device(), device);
+  CHECK_EQ(rejected_probs.device(), device);
+  CHECK_DIM(1, predicts);
+  CHECK_DIM(2, accept_index);
+  CHECK_DIM(1, accept_token_num);
+  CHECK_DIM(2, candidates);
+  CHECK_DIM(2, retrive_index);
+  CHECK_DIM(2, retrive_next_token);
+  CHECK_DIM(2, retrive_next_sibling);
+  CHECK_DIM(2, uniform_samples);
+  CHECK_DIM(3, target_probs);
+  CHECK_DIM(3, rejected_probs);
+  unsigned int batch_size = uniform_samples.size(0);
+  unsigned int num_spec_step = accept_index.size(1);
+  unsigned int num_draft_tokens = candidates.size(1);
+  unsigned int vocab_size = target_probs.size(2);
+  CHECK_EQ(batch_size, candidates.size(0));
+  CHECK_EQ(batch_size, retrive_index.size(0));
+  CHECK_EQ(batch_size, retrive_next_token.size(0));
+  CHECK_EQ(batch_size, retrive_next_sibling.size(0));
+  CHECK_EQ(batch_size, target_probs.size(0));
+  CHECK_EQ(batch_size, rejected_probs.size(0));
+  CHECK_EQ(num_draft_tokens, retrive_index.size(1));
+  CHECK_EQ(num_draft_tokens, retrive_next_token.size(1));
+  CHECK_EQ(num_draft_tokens, retrive_next_sibling.size(1));
+  CHECK_EQ(num_draft_tokens, uniform_samples.size(1));
+  CHECK_EQ(num_draft_tokens, target_probs.size(1));
+  CHECK_EQ(num_draft_tokens, rejected_probs.size(1));
+  CHECK_EQ(vocab_size, rejected_probs.size(2));
+  CHECK_EQ(batch_size, accept_index.size(0));
+  CHECK_EQ(batch_size, accept_token_num.size(0));
+  if (predicts.scalar_type() != at::kInt || accept_index.scalar_type() != at::kInt ||
+      accept_token_num.scalar_type() != at::kInt) {
+    throw std::runtime_error("Expected output tensors to be torch.int32.");
+  }
+  if (candidates.scalar_type() != at::kLong || retrive_index.scalar_type() != at::kLong ||
+      retrive_next_token.scalar_type() != at::kLong || retrive_next_sibling.scalar_type() != at::kLong) {
+    throw std::runtime_error("Expected tree index tensors to be torch.int64.");
+  }
+  if (target_probs.scalar_type() != at::kFloat || rejected_probs.scalar_type() != at::kFloat ||
+      uniform_samples.scalar_type() != at::kFloat || uniform_samples_for_final_sampling.scalar_type() != at::kFloat) {
+    throw std::runtime_error("Expected probability and coin tensors to be torch.float32.");
+  }
+  cudaError_t status = sampling::TreeSpeculativeSamplingEagle<float, int32_t, int64_t>(
+      static_cast<int32_t*>(predicts.data_ptr()),
+      static_cast<int32_t*>(accept_index.data_ptr()),
+      static_cast<int32_t*>(accept_token_num.data_ptr()),
+      static_cast<int64_t*>(candidates.data_ptr()),
+      static_cast<int64_t*>(retrive_index.data_ptr()),
+      static_cast<int64_t*>(retrive_next_token.data_ptr()),
+      static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
+      static_cast<float*>(uniform_samples.data_ptr()),
+      static_cast<float*>(uniform_samples_for_final_sampling.data_ptr()),
+      static_cast<float*>(target_probs.data_ptr()),
+      static_cast<float*>(rejected_probs.data_ptr()),
+      batch_size,
+      num_spec_step,
+      num_draft_tokens,
+      vocab_size,
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "TreeSpeculativeSamplingEagle failed with error code " + std::string(cudaGetErrorString(status)));
+}

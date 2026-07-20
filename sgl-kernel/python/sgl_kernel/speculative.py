@@ -1,6 +1,34 @@
 import torch
 
 
+def tree_speculative_sampling_eagle(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    rejected_probs: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.tree_speculative_sampling_eagle(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
+        rejected_probs,
+    )
+
+
 def tree_speculative_sampling_target_only(
     predicts: torch.Tensor,  # mutable
     accept_index: torch.Tensor,  # mutable

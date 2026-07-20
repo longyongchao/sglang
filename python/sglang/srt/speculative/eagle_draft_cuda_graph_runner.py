@@ -184,7 +184,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                     (self.max_bs, self.model_runner.model_config.vocab_size),
                     dtype=torch.float32,
                 )
-                if self.model_runner.server_args.speculative_use_rejection_sampling
+                if getattr(
+                    self.eagle_worker,
+                    "use_classic_rejection_sampling",
+                    self.model_runner.server_args.speculative_use_rejection_sampling,
+                )
                 else None
             )
             _hidden_size = EagleDraftInput.hidden_size_for(self.eagle_worker)
