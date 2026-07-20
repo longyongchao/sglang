@@ -24,11 +24,14 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.domino_helper import DFlashDominoHelper
+from sglang.srt.speculative.domino_rollout import DFlashDominoRollout
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    is_dflash_domino_projector,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
@@ -173,6 +176,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+        self._domino_rollout = None
+        if is_dflash_domino_projector(draft_config.projector_type):
+            target_config = self.target_worker.model_runner.model_config.hf_config
+            self._domino_rollout = DFlashDominoRollout(
+                domino_helper=DFlashDominoHelper(self.draft_model),
+                block_size=self.block_size,
+                target_vocab_size=int(getattr(target_config, "vocab_size")),
+                global_argmax_from_local_logits=self._global_argmax_from_local_logits,
+                global_argmax_from_local_max=self._global_argmax_from_local_max,
+            )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -657,6 +670,46 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         return int(resolved_id)
+
+    def _global_argmax_from_local_logits(
+        self,
+        *,
+        local_logits: torch.Tensor,
+        local_vocab_start: int,
+        local_token_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        local_max, local_arg = torch.max(local_logits, dim=-1)
+        if local_token_ids is None:
+            global_ids = local_arg.to(torch.int64) + int(local_vocab_start)
+        else:
+            global_ids = torch.gather(local_token_ids, -1, local_arg.unsqueeze(-1)).squeeze(-1)
+        tp_group = get_tp_group()
+        if int(tp_group.world_size) == 1:
+            return global_ids
+        batch = int(local_logits.shape[0])
+        gathered_max = torch.empty((int(tp_group.world_size), batch), dtype=local_max.dtype, device=local_max.device)
+        gathered_ids = torch.empty((int(tp_group.world_size), batch), dtype=torch.int64, device=global_ids.device)
+        tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
+        tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
+        best_rank = torch.argmax(gathered_max, dim=0)
+        return torch.gather(gathered_ids, 0, best_rank.unsqueeze(0)).squeeze(0)
+
+    def _global_argmax_from_local_max(
+        self,
+        *,
+        local_max: torch.Tensor,
+        global_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        tp_group = get_tp_group()
+        if int(tp_group.world_size) == 1:
+            return global_ids
+        batch = int(local_max.shape[0])
+        gathered_max = torch.empty((int(tp_group.world_size), batch), dtype=local_max.dtype, device=local_max.device)
+        gathered_ids = torch.empty((int(tp_group.world_size), batch), dtype=torch.int64, device=global_ids.device)
+        tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
+        tp_group.all_gather_into_tensor(gathered_ids, global_ids.to(torch.int64).contiguous())
+        best_rank = torch.argmax(gathered_max, dim=0)
+        return torch.gather(gathered_ids, 0, best_rank.unsqueeze(0)).squeeze(0)
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1492,7 +1545,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._draft_sampler is not None and draft_out.can_run_graph:
+        if self._domino_rollout is None and self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
@@ -1501,12 +1554,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(
-                    -1, draft_hidden.shape[-1]
-                ),
-                lm_head=lm_head,
-            ).view(bs, int(self.block_size) - 1)
+            if self._domino_rollout is not None:
+                draft_next = self._domino_rollout.rollout_draft_block(
+                    draft_hidden=draft_hidden,
+                    bonus_tokens=block_ids[:, 0],
+                    target_model=target_model,
+                    lm_head=lm_head,
+                )
+            else:
+                draft_next = self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=draft_hidden[:, 1:, :].reshape(
+                        -1, draft_hidden.shape[-1]
+                    ),
+                    lm_head=lm_head,
+                ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])

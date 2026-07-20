@@ -30,6 +30,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
     get_dflash_layer_types,
+    is_dflash_domino_projector,
     parse_dflash_draft_config,
 )
 from sglang.srt.utils import is_npu
@@ -348,6 +349,30 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(default=16)
+
+        self.projector_type: Optional[str] = draft_config.projector_type
+        self.pure_draft_prefix_len = int(draft_config.pure_draft_prefix_len)
+        self.shift_label = bool(draft_config.shift_label)
+        self.gru_hidden_dim = draft_config.gru_hidden_dim
+        self.emb_dim = draft_config.emb_dim
+        if is_dflash_domino_projector(self.projector_type):
+            if self.gru_hidden_dim is None or self.emb_dim is None:
+                raise ValueError("DFLASH Domino requires gru_hidden_dim and emb_dim.")
+            vocab_size = int(getattr(config, "vocab_size", 0))
+            if vocab_size <= 0:
+                raise ValueError("DFLASH Domino requires positive vocab_size.")
+            self.prefix_gru = nn.GRU(
+                input_size=hidden_size,
+                hidden_size=int(self.gru_hidden_dim),
+                num_layers=1,
+                batch_first=True,
+                bias=False,
+            )
+            self.embed_proj = nn.Sequential(
+                nn.Linear(hidden_size + int(self.gru_hidden_dim), int(self.emb_dim), bias=False),
+                nn.SiLU(),
+                nn.Linear(int(self.emb_dim), vocab_size, bias=False),
+            )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
