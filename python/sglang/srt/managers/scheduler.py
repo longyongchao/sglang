@@ -146,7 +146,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     sock_send,
 )
-from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
+from sglang.srt.managers.load_snapshot import (
+    LoadSnapshot,
+    create_load_snapshot_writer,
+)
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
@@ -656,7 +659,7 @@ class Scheduler(
                 return
         writer.publish_counter = 0
         try:
-            writer.write(self.load_inquirer.get_loads())
+            writer.write(LoadSnapshot.from_get_loads_output(self.load_inquirer.get_loads()))
         except Exception as e:
             logger.warning("load snapshot publish failed: %s", e)
 

@@ -213,7 +213,7 @@ class SchedulerLoadInquirer:
             )
 
         return GetLoadsReqOutput(
-            dp_rank=self.ps.dp_rank,
+            dp_rank=self.ps.dp_rank if self.ps.dp_rank is not None else 0,
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,

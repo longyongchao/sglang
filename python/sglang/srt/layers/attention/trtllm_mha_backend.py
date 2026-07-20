@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.kvcache.trtllm_fp8_kv_kernel import (
+from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
 from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (

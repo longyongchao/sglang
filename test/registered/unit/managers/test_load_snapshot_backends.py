@@ -6,6 +6,7 @@ import time
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.load_snapshot import (
     LoadSnapshot,
     ShmLoadSnapshotReader,
@@ -17,6 +18,9 @@ from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_writer,
     should_use_zmq,
     zmq_reader_owner,
+)
+from sglang.srt.managers.scheduler_components.load_inquirer import (
+    SchedulerLoadInquirer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -56,6 +60,53 @@ def _warmup_zmq(writers, reader, attempts=20, interval=0.05):
         if received >= expected:
             return
     raise RuntimeError(f"warmup failed: expected {expected}, received {received}")
+
+
+def _single_rank_load_inquirer() -> SchedulerLoadInquirer:
+    empty_queue = SimpleNamespace(queue=[], retracted_queue=[])
+    stats = SimpleNamespace(
+        gen_throughput=0.0,
+        cache_hit_rate=0.0,
+        utilization=0.0,
+        kv_transfer_speed_gb_s=0.0,
+        kv_transfer_latency_ms=0.0,
+        num_grammar_queue_reqs=0,
+        num_paused_reqs=0,
+        num_retracted_reqs=0,
+    )
+    pool_stats = SimpleNamespace(get_kv_token_stats=lambda: (0, 0.0))
+    return SchedulerLoadInquirer(
+        disaggregation_mode=DisaggregationMode.NULL,
+        ps=SimpleNamespace(dp_rank=None),
+        server_args=SimpleNamespace(enable_lora=False),
+        max_total_num_tokens=1,
+        max_running_requests=1,
+        pool_stats_observer=SimpleNamespace(get_pool_stats=lambda: pool_stats),
+        tp_worker=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(),
+        spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        get_running_batch=lambda: SimpleNamespace(reqs=[]),
+        get_waiting_queue=lambda: [],
+        get_stats=lambda: stats,
+        get_chunked_req=lambda: None,
+        get_disagg_prefill_bootstrap_queue=lambda: empty_queue,
+        get_disagg_prefill_inflight_queue=lambda: [],
+        get_disagg_decode_prealloc_queue=lambda: empty_queue,
+        get_disagg_decode_transfer_queue=lambda: empty_queue,
+        get_spec_total_num_accept_tokens=lambda: 0,
+        get_spec_total_num_forward_ct=lambda: 0,
+    )
+
+
+class TestLoadInquirer(CustomTestCase):
+    def test_single_rank_defaults_dp_rank_to_zero(self):
+        self.assertEqual(_single_rank_load_inquirer().get_loads().dp_rank, 0)
+    def test_single_rank_snapshot_is_serializable(self):
+        load = _single_rank_load_inquirer().get_loads()
+        snapshot = LoadSnapshot.from_get_loads_output(load)
+        self.assertEqual(snapshot.dp_rank, 0)
+        self.assertIsInstance(snapshot.token_usage, float)
+        self.assertIsInstance(snapshot.gen_throughput, float)
 
 
 class TestShmRoundTrip(CustomTestCase):
