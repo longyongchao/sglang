@@ -238,7 +238,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._validate_hot_token_id()
 
         if self.use_eagle3_rejection_sampling and self.hot_token_id is None:
-            draft_vocab_size = self.draft_runner.model_config.vocab_size
+            _, draft_head = self.draft_runner.model.get_embed_and_head()
+            draft_vocab_size = draft_head.shape[0]
             target_vocab_size = self.target_worker.model_config.vocab_size
             if draft_vocab_size != target_vocab_size:
                 raise ValueError(
@@ -314,7 +315,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.hot_token_id is None:
             return
         mapping = self.hot_token_id
-        draft_vocab_size = self.draft_runner.model_config.vocab_size
+        _, draft_head = self.draft_runner.model.get_embed_and_head()
+        draft_vocab_size = draft_head.shape[0]
         target_vocab_size = self.target_worker.model_config.vocab_size
         if mapping.ndim != 1 or not mapping.is_contiguous() or mapping.dtype != torch.int64:
             raise ValueError("d2t token map must be contiguous one-dimensional torch.int64")
@@ -930,14 +932,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ]
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
-        if self.server_args.speculative_use_rejection_sampling:
+        if self.use_classic_rejection_sampling:
             probs = renorm_draft_probs(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info,
-                self.server_args.speculative_use_rejection_sampling,
+                True,
             )
             ret_topk_p, ret_topk_index = fast_sample(probs, num_samples=1)
             ret_draft_probs = probs
+        elif self.use_eagle3_rejection_sampling:
+            probs = renorm_draft_probs(
+                draft_logits_output.next_token_logits,
+                batch.sampling_info,
+                True,
+            )
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+            ret_draft_probs = None
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
@@ -967,8 +977,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index,
             ret_hidden_states,
         )
-        if self.server_args.speculative_use_rejection_sampling:
-            next_draft_input.draft_probs = ret_draft_probs
+        next_draft_input.draft_probs = ret_draft_probs
 
 
 class EAGLEWorkerV2(BaseSpecWorker):

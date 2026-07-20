@@ -575,18 +575,23 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     if server_args.speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
-        # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
-        # the rejection-sampling kernel consumes; everything else (STANDALONE,
-        # FROZEN_KV_MTP, NGRAM, DFLASH) is unsupported.
+        # EAGLE3 verifies target-space tree proposals without draft q; classic
+        # EAGLE supplies an equal-vocabulary q distribution to the chain kernel.
         if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
             raise NotImplementedError(
                 "--speculative-use-rejection-sampling is only supported for "
                 "EAGLE / EAGLE3 / NEXTN, not "
                 f"speculative_algorithm={server_args.speculative_algorithm}."
             )
-        if server_args.speculative_eagle_topk != 1:
+        # EAGLE3 uses official target-only tree rejection at every top-k;
+        # classic EAGLE actual-q rejection remains a linear chain.
+        if (
+            server_args.speculative_algorithm == "EAGLE"
+            and server_args.speculative_eagle_topk != 1
+        ):
             raise ValueError(
-                "--speculative-use-rejection-sampling requires --speculative-eagle-topk=1."
+                "Classic EAGLE rejection sampling requires --speculative-eagle-topk=1; "
+                "EAGLE3 supports full-tree rejection sampling for topk>1."
             )
         if (
             server_args.speculative_accept_threshold_single != 1.0

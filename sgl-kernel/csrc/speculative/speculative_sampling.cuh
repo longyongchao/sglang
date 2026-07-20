@@ -173,7 +173,15 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   // value at not used indices are undefined
 }
 
-template <typename DType, typename IdType, typename IdType2>
+template <
+    uint32_t BLOCK_THREADS,
+    BlockScanAlgorithm SCAN_ALGORITHM,
+    BlockReduceAlgorithm REDUCE_ALGORITHM,
+    uint32_t VEC_SIZE,
+    bool DETERMINISTIC,
+    typename DType,
+    typename IdType,
+    typename IdType2>
 __global__ void TreeSpeculativeSamplingEagleKernel(
     IdType* predicts,
     IdType* accept_index,
@@ -189,62 +197,122 @@ __global__ void TreeSpeculativeSamplingEagleKernel(
     uint32_t num_speculative_tokens,
     uint32_t num_draft_tokens,
     uint32_t d) {
-  if (threadIdx.x != 0) return;
-  const uint32_t bx = blockIdx.x;
+  const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t base = bx * num_draft_tokens;
-  IdType2 accepted_retrieve_idx = retrive_index[base];
-  IdType2 current_node = 0;
-  uint32_t accepted = 0;
-  accept_index[bx * num_speculative_tokens] = accepted_retrieve_idx;
+  __shared__ IdType2 accepted_retrieve_idx;
+  __shared__ IdType2 current_node;
+  __shared__ uint32_t accepted;
+  __shared__ DType remaining_mass;
+  if (tx == 0) {
+    accepted_retrieve_idx = retrive_index[base];
+    current_node = 0;
+    accepted = 0;
+    accept_index[bx * num_speculative_tokens] = accepted_retrieve_idx;
+  }
+  __syncthreads();
+
+  extern __shared__ __align__(alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
+      uint8_t smem_sampling[];
+  auto& temp_storage =
+      reinterpret_cast<SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem_sampling);
 
   for (uint32_t depth = 1; depth < num_speculative_tokens; ++depth) {
-    IdType2 node = retrive_next_token[base + current_node];
-    DType remaining_mass = DType(1);
+    IdType2 node;
+    if (tx == 0) {
+      node = retrive_next_token[base + current_node];
+      remaining_mass = DType(1);
+      temp_storage.sampled_id = static_cast<int>(node);
+      temp_storage.last_valid_id = 0;
+    }
+    __syncthreads();
+    node = static_cast<IdType2>(temp_storage.sampled_id);
     bool found = false;
     while (node != static_cast<IdType2>(-1)) {
-      const IdType2 token = candidates[base + node];
-      const uint32_t row = base + node;
-      const DType p = target_probs[row * d + token];
-      const DType coin = uniform_samples[row];
-      if (remaining_mass > DType(0) && coin * remaining_mass <= p) {
-        predicts[accepted_retrieve_idx] = token;
-        ++accepted;
-        const IdType2 retrieve_idx = retrive_index[row];
-        accept_index[bx * num_speculative_tokens + accepted] = retrieve_idx;
-        accepted_retrieve_idx = retrieve_idx;
-        current_node = node;
-        found = true;
-        break;
+      if (tx == 0) {
+        const IdType2 token = candidates[base + node];
+        const uint32_t row = base + node;
+        const DType p = target_probs[(base + current_node) * d + token];
+        const DType coin = uniform_samples[row];
+        if (remaining_mass > DType(0) && coin * remaining_mass <= p) {
+          predicts[accepted_retrieve_idx] = token;
+          ++accepted;
+          const IdType2 retrieve_idx = retrive_index[row];
+          accept_index[bx * num_speculative_tokens + accepted] = retrieve_idx;
+          accepted_retrieve_idx = retrieve_idx;
+          current_node = node;
+          found = true;
+        } else {
+          rejected_probs[(base + current_node) * d + token] = p;
+          remaining_mass = max(remaining_mass - p, DType(0));
+          node = retrive_next_sibling[row];
+        }
+        temp_storage.sampled_id = static_cast<int>(node);
+        temp_storage.last_valid_id = found ? 1 : 0;
       }
-      rejected_probs[row * d + token] = p;
-      remaining_mass = max(remaining_mass - p, DType(0));
-      node = retrive_next_sibling[row];
+      __syncthreads();
+      node = static_cast<IdType2>(temp_storage.sampled_id);
+      found = temp_storage.last_valid_id != 0;
+      if (found) break;
     }
     if (!found) break;
   }
 
-  accept_token_num[bx] = accepted;
+  if (tx == 0) accept_token_num[bx] = accepted;
   const uint32_t row = base + current_node;
+  const bool deepest_draft_accepted = accepted == num_speculative_tokens - 1;
   const DType coin = uniform_samples_for_final_sampling[bx];
-  DType mass = DType(0);
-  int32_t last_valid = -1;
-  for (uint32_t i = 0; i < d; ++i) {
-    const DType residual = max(target_probs[row * d + i] - rejected_probs[row * d + i], DType(0));
-    if (residual > DType(0)) last_valid = static_cast<int32_t>(i);
-    mass += residual;
-  }
-  const DType threshold = coin * mass;
-  DType cumulative = DType(0);
-  int32_t sampled = last_valid >= 0 ? last_valid : static_cast<int32_t>(d - 1);
-  for (uint32_t i = 0; i < d; ++i) {
-    const DType residual = max(target_probs[row * d + i] - rejected_probs[row * d + i], DType(0));
-    cumulative += residual;
-    if (cumulative >= threshold && residual > DType(0)) {
-      sampled = static_cast<int32_t>(i);
-      break;
+  DType sum_residual(0);
+  vec_t<DType, VEC_SIZE> target_vec, rejected_vec;
+  DType residual[VEC_SIZE];
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    target_vec.fill(DType(0));
+    rejected_vec.fill(DType(0));
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      target_vec.load(target_probs + row * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      if (!deepest_draft_accepted) {
+        rejected_vec.load(rejected_probs + row * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      }
     }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      residual[j] = max(target_vec[j] - rejected_vec[j], DType(0));
+    }
+    sum_residual += BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+                        .Sum<VEC_SIZE>(residual);
+    __syncthreads();
   }
-  predicts[accepted_retrieve_idx] = sampled;
+  if (tx == 0) temp_storage.block_aggregate.value = sum_residual;
+  temp_storage.sampled_id = d;
+  temp_storage.last_valid_id = -1;
+  __syncthreads();
+  const DType threshold = coin * temp_storage.block_aggregate.value;
+  DType aggregate_residual(0);
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    target_vec.fill(DType(0));
+    rejected_vec.fill(DType(0));
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      target_vec.load(target_probs + row * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      if (!deepest_draft_accepted) {
+        rejected_vec.load(rejected_probs + row * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      }
+    }
+    vec_t<DType, VEC_SIZE> residual_vec;
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      residual_vec[j] = max(target_vec[j] - rejected_vec[j], DType(0));
+    }
+    DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
+        i, d, [&](DType x) { return x > 0; }, threshold, residual_vec, aggregate_residual, &temp_storage);
+    if (aggregate_residual > threshold) break;
+  }
+  __syncthreads();
+  if (tx == 0) {
+    int sampled = temp_storage.sampled_id;
+    if (sampled == d) {
+      sampled = temp_storage.last_valid_id == -1 ? static_cast<int>(d - 1) : temp_storage.last_valid_id;
+    }
+    predicts[accepted_retrieve_idx] = sampled;
+  }
 }
 
 template <typename DType, typename IdType, typename IdType2>
@@ -265,22 +333,42 @@ cudaError_t TreeSpeculativeSamplingEagle(
     uint32_t num_draft_tokens,
     uint32_t d,
     cudaStream_t stream = 0) {
-  TreeSpeculativeSamplingEagleKernel<<<batch_size, 1, 0, stream>>>(
-      predicts,
-      output_token_ids,
-      output_accepted_token_num,
-      candidates,
-      retrive_index,
-      retrive_next_token,
-      retrive_next_sibling,
-      uniform_samples,
-      uniform_samples_for_final_sampling,
-      target_probs,
-      rejected_probs,
-      num_speculative_tokens,
-      num_draft_tokens,
-      d);
-  return cudaGetLastError();
+  constexpr uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
+  const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  void* args[] = {
+      &predicts,
+      &output_token_ids,
+      &output_accepted_token_num,
+      &candidates,
+      &retrive_index,
+      &retrive_next_token,
+      &retrive_next_sibling,
+      &uniform_samples,
+      &uniform_samples_for_final_sampling,
+      &target_probs,
+      &rejected_probs,
+      &num_speculative_tokens,
+      &num_draft_tokens,
+      &d};
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    DISPATCH_DETERMINISTIC(true, DETERMINISTIC, {
+      auto kernel = TreeSpeculativeSamplingEagleKernel<
+          BLOCK_THREADS,
+          SCAN_ALGO,
+          REDUCE_ALGO,
+          VEC_SIZE,
+          DETERMINISTIC,
+          DType,
+          IdType,
+          IdType2>;
+      FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    });
+  });
+  return cudaSuccess;
 }
 
 template <typename DType, typename IdType, typename IdType2>
