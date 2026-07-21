@@ -24,6 +24,7 @@ _DOMINO_CANDIDATE_BLOCK_C = 512
 _DOMINO_CANDIDATE_POOL_SIZE = 2048
 _DOMINO_TP_SCORER_CUSHION_MB = 2048
 _DOMINO_TP_GRU_TABLE_CUSHION_MB = 1024
+_DOMINO_FOLD_LOGITS_BUDGET_MB = 128
 
 
 class DFlashDominoRollout:
@@ -759,6 +760,83 @@ class DFlashDominoRollout:
         n = torch.tanh(gi[:, 2 * G :] + r * gh[:, 2 * G :])
         return (1.0 - z_gate) * n + z_gate * gru_h
 
+    def _run_domino_rollout_loop(
+        self,
+        *,
+        out_target: torch.Tensor,
+        num_draft: int,
+        org_vocab_start: int,
+        gru_h: torch.Tensor,
+        z_proj: torch.Tensor,
+        base_logits: torch.Tensor,
+        w_sh_T: torch.Tensor,
+        sh_buf: torch.Tensor,
+        s_proj_buf: torch.Tensor,
+        gh_buf: torch.Tensor,
+        h_new_buf: torch.Tensor,
+        argmax_val_buf: torch.Tensor,
+        argmax_idx_buf: torch.Tensor,
+        local_tok_buf: torch.Tensor,
+        fc2_w_shard: torch.Tensor,
+        fc2_b_shard: Optional[torch.Tensor],
+        b_hh_static: Optional[torch.Tensor],
+        gru_input_table: torch.Tensor,
+        candidate_ids: Optional[torch.Tensor],
+    ) -> None:
+        '''Capture-safe rollout loop over draft slots 2..block_size-1.
+
+        Shared by the lazy standalone loop graph (eager-prologue fallback)
+        and the DominoDraftSampler tail hook that folds the whole rollout
+        into the draft cuda graph.
+        '''
+
+        h_state = gru_h
+        for k in range(1, num_draft):
+            torch.matmul(h_state, w_sh_T, out=sh_buf)
+            if candidate_ids is not None:
+                fused_silu_fc2_candidate_argmax(
+                    z_proj=z_proj[:, k, :],
+                    s_proj=s_proj_buf,
+                    fc2_weight=fc2_w_shard,
+                    fc2_bias=fc2_b_shard,
+                    base_logits=base_logits[:, k, :],
+                    candidate_ids=candidate_ids,
+                    out_val=argmax_val_buf,
+                    out_idx=argmax_idx_buf,
+                    final_token=local_tok_buf,
+                    block_c=_DOMINO_CANDIDATE_BLOCK_C,
+                    block_m=_DOMINO_BLOCK_M,
+                    num_warps=_DOMINO_SCORE_NUM_WARPS,
+                    num_stages=_DOMINO_SCORE_NUM_STAGES,
+                )
+            else:
+                fused_silu_fc2_argmax(
+                    z_proj=z_proj[:, k, :],
+                    s_proj=s_proj_buf,
+                    fc2_weight=fc2_w_shard,
+                    fc2_bias=fc2_b_shard,
+                    base_logits=base_logits[:, k, :],
+                    out_val=argmax_val_buf,
+                    out_idx=argmax_idx_buf,
+                    final_token=local_tok_buf,
+                    block_v=_DOMINO_BLOCK_V,
+                    block_m=_DOMINO_BLOCK_M,
+                    num_warps=_DOMINO_SCORE_NUM_WARPS,
+                    num_stages=_DOMINO_SCORE_NUM_STAGES,
+                )
+            tok_full = local_tok_buf + org_vocab_start
+            out_target[:, k] = tok_full
+            if k + 1 < num_draft:
+                fused_gru_cell_from_table(
+                    tok_full=tok_full,
+                    gru_input_table=gru_input_table,
+                    gh=gh_buf,
+                    gh_bias=b_hh_static,
+                    h_state=h_state,
+                    h_out=h_new_buf,
+                )
+                h_state = h_new_buf
+
     def _get_or_capture_domino_loop_graph(
         self,
         *,
@@ -811,9 +889,6 @@ class DFlashDominoRollout:
         out_buf = torch.empty((bs, num_draft), dtype=torch.long, device=device)
 
         block_v = _DOMINO_BLOCK_V
-        block_m = _DOMINO_BLOCK_M
-        score_num_warps = _DOMINO_SCORE_NUM_WARPS
-        score_num_stages = _DOMINO_SCORE_NUM_STAGES
         candidate_block_c = _DOMINO_CANDIDATE_BLOCK_C
         num_score_blocks = (
             (candidate_pool_size + candidate_block_c - 1) // candidate_block_c
@@ -872,54 +947,27 @@ class DFlashDominoRollout:
             static_refs.append(candidate_ids_buf)
 
         def run_loop(out_target):
-            h_state = gru_h_buf
-            for k in range(1, num_draft):
-                torch.matmul(h_state, w_sh_T, out=sh_buf)
-                if use_candidate_pool:
-                    assert candidate_ids_buf is not None
-                    fused_silu_fc2_candidate_argmax(
-                        z_proj=z_proj_buf[:, k, :],
-                        s_proj=s_proj_buf,
-                        fc2_weight=fc2_w_shard,
-                        fc2_bias=fc2_b_shard,
-                        base_logits=base_logits_buf[:, k, :],
-                        candidate_ids=candidate_ids_buf,
-                        out_val=argmax_val_buf,
-                        out_idx=argmax_idx_buf,
-                        final_token=local_tok_buf,
-                        block_c=candidate_block_c,
-                        block_m=block_m,
-                        num_warps=score_num_warps,
-                        num_stages=score_num_stages,
-                    )
-                else:
-                    fused_silu_fc2_argmax(
-                        z_proj=z_proj_buf[:, k, :],
-                        s_proj=s_proj_buf,
-                        fc2_weight=fc2_w_shard,
-                        fc2_bias=fc2_b_shard,
-                        base_logits=base_logits_buf[:, k, :],
-                        out_val=argmax_val_buf,
-                        out_idx=argmax_idx_buf,
-                        final_token=local_tok_buf,
-                        block_v=block_v,
-                        block_m=block_m,
-                        num_warps=score_num_warps,
-                        num_stages=score_num_stages,
-                    )
-                tok_full = local_tok_buf + org_vocab_start
-                out_target[:, k] = tok_full
-                if k + 1 < num_draft:
-                    fused_gru_cell_from_table(
-                        tok_full=tok_full,
-                        gru_input_table=gru_input_table,
-                        gh=gh_buf,
-                        gh_bias=b_hh_static,
-                        h_state=h_state,
-                        h_out=h_new_buf,
-                    )
-                    h_state = h_new_buf
-            return None
+            self._run_domino_rollout_loop(
+                out_target=out_target,
+                num_draft=num_draft,
+                org_vocab_start=org_vocab_start,
+                gru_h=gru_h_buf,
+                z_proj=z_proj_buf,
+                base_logits=base_logits_buf,
+                w_sh_T=w_sh_T,
+                sh_buf=sh_buf,
+                s_proj_buf=s_proj_buf,
+                gh_buf=gh_buf,
+                h_new_buf=h_new_buf,
+                argmax_val_buf=argmax_val_buf,
+                argmax_idx_buf=argmax_idx_buf,
+                local_tok_buf=local_tok_buf,
+                fc2_w_shard=fc2_w_shard,
+                fc2_b_shard=fc2_b_shard,
+                b_hh_static=b_hh_static,
+                gru_input_table=gru_input_table,
+                candidate_ids=candidate_ids_buf if use_candidate_pool else None,
+            )
 
         warmup_out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
         for _ in range(2):
@@ -949,6 +997,66 @@ class DFlashDominoRollout:
             num_draft,
         )
         return entry
+
+    def build_capture_sampler(
+        self,
+        *,
+        target_model,
+        lm_head,
+        num_org: int,
+        org_vocab_start: int,
+        capture_bs_list,
+    ) -> Optional["DominoDraftSampler"]:
+        '''Build the tail hook that folds the whole rollout into the draft
+        cuda graph. The caller checks fold eligibility (tp=1, dense lm_head,
+        no added vocab).'''
+
+        num_draft = self.block_size - 1
+        # The in-graph base_logits temporary dominates fold memory; cap the
+        # folded batch size so it stays within a fixed budget. Larger batches
+        # fall back to the eager rollout path. Snap the cap to an actually
+        # captured batch size so any replayed graph serving bs <= fold_max_bs
+        # is guaranteed to contain the folded rollout.
+        per_bs_bytes = num_draft * int(num_org) * lm_head.weight.element_size()
+        budget_bytes = _DOMINO_FOLD_LOGITS_BUDGET_MB * 1024 * 1024
+        budget_max_bs = budget_bytes // per_bs_bytes
+        fold_bs_candidates = [int(b) for b in capture_bs_list if int(b) <= budget_max_bs]
+        if not fold_bs_candidates:
+            logger.warning(
+                "[DFLASH Domino] rollout fold disabled: base_logits budget "
+                "(%d MiB) cannot cover the smallest capture batch size.",
+                _DOMINO_FOLD_LOGITS_BUDGET_MB,
+            )
+            return None
+        fold_max_bs = max(fold_bs_candidates)
+        state = self.domino_helper.get_rollout_state()
+        embed_module = target_model.get_input_embeddings()
+        gru_input_table = self.domino_helper.get_gru_input_proj_table(
+            embed_module.weight
+        )
+        candidate_pool_size = self._resolve_domino_candidate_pool_size(
+            int(num_org),
+            warn_on_disable=True,
+        )
+        logger.info(
+            "[DFLASH Domino] rollout folded into the draft cuda graph "
+            "(fold_max_bs=%d, candidate_pool_size=%d).",
+            fold_max_bs,
+            candidate_pool_size,
+        )
+        return DominoDraftSampler(
+            rollout=self,
+            weight=lm_head.weight,
+            num_org=int(num_org),
+            org_vocab_start=int(org_vocab_start),
+            state=state,
+            gru_input_table=gru_input_table,
+            candidate_pool_size=candidate_pool_size,
+            shift_label=bool(
+                getattr(self.domino_helper.draft_model, "shift_label", False)
+            ),
+            max_bs=fold_max_bs,
+        )
 
     def rollout_draft_block(
         self,
@@ -1081,7 +1189,7 @@ class DFlashDominoRollout:
             z_dtype=z.dtype,
             device=device,
             state=state,
-            embed_module=embed_module,
+            full_gru_input_table=gru_input_table,
         )
 
         z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
@@ -1109,3 +1217,146 @@ class DFlashDominoRollout:
         graph_entry["graph"].replay()
         out = graph_entry["out_buf"]
         return out
+
+
+class DominoDraftSampler:
+    '''Capture-safe Domino rollout run inside the draft cuda graph.
+
+    Registered as a capture tail hook (mirrors
+    dflash_worker_v2._DflashDraftSampler): the base-logits GEMM, candidate
+    pool topk, prefix-GRU init, and the fused rollout loop are all recorded
+    into the draft graph, so the per-step eager prologue and the standalone
+    loop-graph replay disappear. The worker reads `out` after replay.
+    tp=1 / no-added-vocab only; other setups stay eager in the worker.
+    '''
+
+    def __init__(
+        self,
+        *,
+        rollout: DFlashDominoRollout,
+        weight: torch.Tensor,
+        num_org: int,
+        org_vocab_start: int,
+        state: dict,
+        gru_input_table: torch.Tensor,
+        candidate_pool_size: int,
+        shift_label: bool,
+        max_bs: int,
+    ) -> None:
+        self.rollout = rollout
+        self.weight = weight
+        self.block_size = int(rollout.block_size)
+        self.num_draft = self.block_size - 1
+        self.num_org = int(num_org)
+        self.org_vocab_start = int(org_vocab_start)
+        self.state = state
+        self.gru_input_table = gru_input_table
+        self.candidate_pool_size = max(0, int(candidate_pool_size))
+        self.shift_label = bool(shift_label)
+        self.max_bs = int(max_bs)
+        self.emb_dim = int(state["w_z"].shape[0])
+        self.num_score_blocks = (
+            (self.candidate_pool_size + _DOMINO_CANDIDATE_BLOCK_C - 1)
+            // _DOMINO_CANDIDATE_BLOCK_C
+            if self.candidate_pool_size > 0
+            else (self.num_org + _DOMINO_BLOCK_V - 1) // _DOMINO_BLOCK_V
+        )
+        self.fc2_w_shard, self.fc2_b_shard = rollout._slice_domino_fc2(
+            state=state,
+            start=self.org_vocab_start,
+            length=self.num_org,
+        )
+        # Draft tokens for slots 1..block_size-1: written in-graph, read by
+        # the worker after replay.
+        self.out = torch.empty(
+            (self.max_bs, self.num_draft),
+            dtype=torch.int64,
+            device=weight.device,
+        )
+
+    def __call__(self, hidden_states: torch.Tensor, input_ids=None) -> None:
+        bs = hidden_states.shape[0] // self.block_size
+        if bs > self.max_bs:
+            # Graphs beyond the fold cap skip the fold entirely; the worker
+            # runs the eager rollout for those batch sizes.
+            return
+        rollout = self.rollout
+        state = self.state
+        num_draft = self.num_draft
+        device = hidden_states.device
+
+        hidden = hidden_states.view(bs, self.block_size, -1)
+        if self.shift_label:
+            z = hidden[:, :num_draft, :].contiguous()
+        else:
+            z = hidden[:, 1:, :].contiguous()
+        z_score = z.to(self.weight.dtype) if z.dtype != self.weight.dtype else z
+
+        base_logits = torch.matmul(
+            z_score.reshape(bs * num_draft, z_score.shape[-1]),
+            self.weight[: self.num_org].T,
+        ).view(bs, num_draft, self.num_org)
+
+        candidate_ids = None
+        if self.candidate_pool_size > 0:
+            pool_source = (
+                base_logits[:, 1:, :] if num_draft > 1 else base_logits[:, :1, :]
+            )
+            pool_logits = pool_source.max(dim=1).values
+            candidate_ids = torch.topk(
+                pool_logits, k=self.candidate_pool_size, dim=-1
+            ).indices.contiguous()
+
+        slot_1 = (
+            torch.argmax(base_logits[:, 0, :], dim=-1) + self.org_vocab_start
+        ).to(torch.long)
+        bonus_tokens = input_ids.view(bs, self.block_size)[:bs, 0].to(torch.long)
+
+        gru_h = rollout._init_domino_prefix_gru_hidden(
+            prefix_ids=torch.stack([bonus_tokens, slot_1], dim=1),
+            z_dtype=z.dtype,
+            device=device,
+            state=state,
+            full_gru_input_table=self.gru_input_table,
+        )
+        if gru_h.dtype != z.dtype:
+            gru_h = gru_h.to(z.dtype)
+
+        z_proj = torch.nn.functional.linear(z, state["w_z"], state["b1"])
+
+        gru_hidden = int(state["gru_hidden_size"])
+        sh_buf = torch.empty(
+            (bs, self.emb_dim + 3 * gru_hidden), dtype=z.dtype, device=device
+        )
+        h_new_buf = torch.empty((bs, gru_hidden), dtype=z.dtype, device=device)
+        argmax_val_buf = torch.empty(
+            (bs, self.num_score_blocks), dtype=torch.float32, device=device
+        )
+        argmax_idx_buf = torch.empty(
+            (bs, self.num_score_blocks), dtype=torch.int32, device=device
+        )
+        local_tok_buf = torch.empty((bs,), dtype=torch.long, device=device)
+
+        out_slice = self.out[:bs]
+        out_slice[:, 0].copy_(slot_1)
+        rollout._run_domino_rollout_loop(
+            out_target=out_slice,
+            num_draft=num_draft,
+            org_vocab_start=self.org_vocab_start,
+            gru_h=gru_h,
+            z_proj=z_proj,
+            base_logits=base_logits,
+            w_sh_T=state["w_s_hh_T"],
+            sh_buf=sh_buf,
+            s_proj_buf=sh_buf[:, : self.emb_dim],
+            gh_buf=sh_buf[:, self.emb_dim :],
+            h_new_buf=h_new_buf,
+            argmax_val_buf=argmax_val_buf,
+            argmax_idx_buf=argmax_idx_buf,
+            local_tok_buf=local_tok_buf,
+            fc2_w_shard=self.fc2_w_shard,
+            fc2_b_shard=self.fc2_b_shard,
+            b_hh_static=state["b_hh"],
+            gru_input_table=self.gru_input_table,
+            candidate_ids=candidate_ids,
+        )
