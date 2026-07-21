@@ -98,27 +98,29 @@ def _dspark_fused_markov_bias_argmax_kernel(
 
         acc += tl.sum(fc2_block * latent_block[None, :], axis=1)
 
-    # Add base logits
+    # 对齐 eager 的原生精度边界：linear 将 fp32 累加结果写回输入精度，
+    # 随后的 logits 加法再次写回该精度。
+    input_dtype = base_ptr.dtype.element_ty
+    projected = acc.to(input_dtype)
     base_block = tl.load(
         base_ptr + pid_b * stride_base_b + offs_v * stride_base_v,
         mask=mask_v,
         other=-float("inf"),
         cache_modifier=".cg",
-    ).to(tl.float32)
-    acc += base_block
+    )
+    logits = (projected + base_block).to(input_dtype).to(tl.float32)
+    logits = tl.where(mask_v, logits, -float("inf"))
 
-    # Mask invalid positions
-    acc = tl.where(mask_v, acc, -float("inf"))
-
-    # Local argmax within this tile
-    local_max_val = tl.max(acc, axis=0)
-    local_max_idx = tl.argmax(acc, axis=0)
-    global_max_idx = pid_v * BLOCK_V + local_max_idx
+    # 字典序 argmax：值较大者优先，值相同时词表索引较小者优先。
+    local_max_val = tl.max(logits, axis=0)
+    local_max_idx = tl.min(
+        tl.where(mask_v & (logits == local_max_val), offs_v, V), axis=0
+    )
 
     out_val_offs = pid_b * stride_outv_b + pid_v * stride_outv_n
     out_idx_offs = pid_b * stride_outi_b + pid_v * stride_outi_n
     tl.store(out_val_ptr + out_val_offs, local_max_val)
-    tl.store(out_idx_ptr + out_idx_offs, global_max_idx)
+    tl.store(out_idx_ptr + out_idx_offs, local_max_idx)
 
 
 # ---------------------------------------------------------------------------
@@ -148,14 +150,19 @@ def _dspark_reduce_argmax_kernel(
             out_val_ptr + pid_b * stride_val_b + offs_n * stride_val_n,
             mask=mask_n, other=-float("inf"),
         )
-        local_pos = tl.argmax(vals, axis=0)
+        indices = tl.load(
+            out_idx_ptr + pid_b * stride_idx_b + offs_n * stride_idx_n,
+            mask=mask_n,
+            other=2147483647,
+        )
         local_val = tl.max(vals, axis=0)
-        local_idx = tl.load(
-            out_idx_ptr + pid_b * stride_idx_b
-            + (start_n + local_pos) * stride_idx_n
+        local_idx = tl.min(
+            tl.where(mask_n & (vals == local_val), indices, 2147483647), axis=0
         )
 
-        take = local_val > best_val
+        take = (local_val > best_val) | (
+            (local_val == best_val) & (local_idx < best_idx)
+        )
         best_val = tl.where(take, local_val, best_val)
         best_idx = tl.where(take, local_idx, best_idx)
 

@@ -111,7 +111,10 @@ class DsparkDraftSampler:
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.gamma)[:, 0]
 
-        if self._fused_scratch is not None and hasattr(self.markov_head, "sample_block_fused"):
+        if (
+            self._fused_scratch is not None
+            and self.markov_head.markov_head_type in ("vanilla", "rnn")
+        ):
             draft_tokens = self.markov_head.sample_block_fused(
                 base_logits,
                 first_prev_tokens=anchor,
