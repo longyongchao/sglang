@@ -391,6 +391,17 @@ class DFlashDraftModel(nn.Module):
             )
         return self.hidden_norm(self.fc(target_hidden))
 
+    def prepare_context_hidden_for_kv(
+        self, layer: DFlashDecoderLayer, ctx_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the per-layer ctx hidden used for KV materialization.
+
+        DFlash shares one ctx hidden across all draft layers; variants with
+        per-layer ctx hidden (e.g. DFlare) override this.
+        """
+        del layer
+        return ctx_hidden
+
     @torch.no_grad()
     def forward(
         self,
