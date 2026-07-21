@@ -127,6 +127,47 @@ class VanillaMarkov(nn.Module):
             sampler=sampler,
         )
 
+    def sample_block_fused(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        scratch: "MarkovFusedScratch",
+    ) -> torch.Tensor:
+        """Fused greedy sampling: embed[prev_tok] @ w2.T + base -> argmax, per step.
+
+        Returns draft_tokens [B, proposal_len]. No corrected_logits (not needed
+        in the folded graph path).
+        """
+        from sglang.srt.speculative.dspark_components.kernels.dspark_markov_fused import (
+            fused_markov_bias_argmax,
+        )
+
+        batch_size, proposal_len = base_logits.shape[:2]
+        device = base_logits.device
+        if proposal_len == 0:
+            return torch.empty(batch_size, 0, dtype=torch.long, device=device)
+
+        embed_table = self.markov_w1.weight  # [V_emb, R]
+        fc2_weight = self.markov_w2.weight   # [V, R]
+
+        prev_tokens = first_prev_tokens.long()
+        sampled_tokens = []
+        for step_idx in range(proposal_len):
+            fused_markov_bias_argmax(
+                prev_tokens=prev_tokens,
+                embed_table=embed_table,
+                fc2_weight=fc2_weight,
+                base_logits=base_logits[:, step_idx, :],
+                out_val=scratch.out_val[:batch_size],
+                out_idx=scratch.out_idx[:batch_size],
+                final_token=scratch.tok_buf[:batch_size],
+            )
+            prev_tokens = scratch.tok_buf[:batch_size]
+            sampled_tokens.append(prev_tokens.clone())
+        return torch.stack(sampled_tokens, dim=1)
+
 
 class GatedMarkovHead(VanillaMarkov):
 
@@ -259,6 +300,78 @@ class RNNHead(VanillaMarkov):
             torch.stack(sampled_tokens, dim=1),
             torch.cat(corrected_logits, dim=1),
         )
+
+    def sample_block_fused(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        scratch: "MarkovFusedScratch",
+    ) -> torch.Tensor:
+        """Fused greedy RNN sampling: joint_proj (cuBLAS) + fused_rnn_cell + fused_markov_bias_argmax.
+
+        Returns draft_tokens [B, proposal_len].
+        """
+        from sglang.srt.speculative.dspark_components.kernels.dspark_markov_fused import (
+            fused_dspark_rnn_cell,
+            fused_markov_bias_argmax,
+        )
+
+        if hidden_states is None:
+            raise ValueError("RNNHead requires hidden_states.")
+        batch_size, proposal_len = base_logits.shape[:2]
+        device = base_logits.device
+        if proposal_len == 0:
+            return torch.empty(batch_size, 0, dtype=torch.long, device=device)
+
+        embed_table = self.markov_w1.weight  # [V_emb, R]
+        fc2_weight = self.markov_w2.weight   # [V, R]
+        R = self.markov_rank
+
+        # Initialize RNN state to zeros
+        state = scratch.rnn_state_buf[:batch_size, :R].zero_()
+        new_state = scratch.rnn_new_state_buf[:batch_size, :R]
+        output_emb = scratch.output_emb_buf[:batch_size, :R]
+        proj_buf = scratch.rnn_proj_buf[:batch_size]
+
+        prev_tokens = first_prev_tokens.long()
+        sampled_tokens = []
+        for step_idx in range(proposal_len):
+            # Build joint_proj input: cat([state, prev_emb, hidden])
+            prev_emb = self.get_prev_embeddings(prev_tokens)
+            joint_input = torch.cat(
+                [state, prev_emb, hidden_states[:, step_idx, :]], dim=-1
+            )
+            # cuBLAS matmul: joint_proj linear
+            proj_buf.copy_(
+                torch.nn.functional.linear(
+                    joint_input, self.joint_proj.weight, self.joint_proj.bias,
+                )
+            )
+            # Fused RNN cell
+            fused_dspark_rnn_cell(
+                proj_out=proj_buf,
+                state=state,
+                new_state=new_state,
+                output_emb=output_emb,
+            )
+            # Swap state buffers
+            state, new_state = new_state, state
+            # Fused argmax: output_emb @ fc2_weight.T + base_logits -> argmax
+            fused_markov_bias_argmax(
+                prev_tokens=prev_tokens,
+                embed_table=embed_table,
+                fc2_weight=fc2_weight,
+                base_logits=base_logits[:, step_idx, :],
+                out_val=scratch.out_val[:batch_size],
+                out_idx=scratch.out_idx[:batch_size],
+                final_token=scratch.tok_buf[:batch_size],
+                latent=output_emb,
+            )
+            prev_tokens = scratch.tok_buf[:batch_size]
+            sampled_tokens.append(prev_tokens.clone())
+        return torch.stack(sampled_tokens, dim=1)
 
 
 def build_markov_head(config) -> Optional[nn.Module]:

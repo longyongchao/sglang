@@ -74,18 +74,57 @@ class DsparkDraftSampler:
             if confidence_fn is not None
             else None
         )
+        # Fused kernel scratch buffers
+        self._fused_scratch = self._try_build_scratch(
+            model=model, max_bs=max_bs, device=device
+        )
+
+    @staticmethod
+    def _try_build_scratch(*, model, max_bs, device):
+        try:
+            from sglang.srt.speculative.dspark_components.kernels.dspark_markov_fused import (
+                MarkovFusedScratch,
+            )
+
+            markov_head = model.markov_head
+            vocab_size = markov_head.vocab_size
+            markov_rank = markov_head.markov_rank
+            is_rnn = markov_head.markov_head_type == "rnn"
+            hidden_size = getattr(markov_head, "hidden_size", 0)
+            # Determine dtype from the embedding weight
+            dtype = markov_head.markov_w1.weight.dtype
+            return MarkovFusedScratch(
+                max_bs=int(max_bs),
+                vocab_size=vocab_size,
+                markov_rank=markov_rank,
+                hidden_size=hidden_size,
+                device=device,
+                dtype=dtype,
+                is_rnn=is_rnn,
+            )
+        except Exception:
+            return None
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.gamma
         base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.gamma)[:, 0]
-        draft_tokens, _ = self.markov_head.sample_block(
-            base_logits,
-            first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
-            sampler=greedy_step_sampler,
-        )
+
+        if self._fused_scratch is not None and hasattr(self.markov_head, "sample_block_fused"):
+            draft_tokens = self.markov_head.sample_block_fused(
+                base_logits,
+                first_prev_tokens=anchor,
+                hidden_states=hidden_states.view(bs, self.gamma, -1),
+                scratch=self._fused_scratch,
+            )
+        else:
+            draft_tokens, _ = self.markov_head.sample_block(
+                base_logits,
+                first_prev_tokens=anchor,
+                hidden_states=hidden_states.view(bs, self.gamma, -1),
+                sampler=greedy_step_sampler,
+            )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
