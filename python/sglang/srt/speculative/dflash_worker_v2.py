@@ -155,6 +155,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
+        self._domino_sampler = None
         self.draft_model = bundle.draft_model
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -316,12 +317,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                     available_mem,
                 )
         if capture_decode_cuda_graph:
-            # Must run before capture so the draft graph folds the head in.
-            self._draft_sampler = self._maybe_build_draft_sampler()
-            if self._draft_sampler is not None:
-                self.draft_model_runner.capture_tail_hooks.append(
-                    make_draft_sampler_capture_hook(self._draft_sampler)
-                )
+            # Must run before capture so the draft graph folds the head
+            # (or, for Domino, the whole rollout) in.
+            if self._domino_rollout is not None:
+                self._domino_sampler = self._maybe_build_domino_sampler()
+                if self._domino_sampler is not None:
+                    self.draft_model_runner.capture_tail_hooks.append(
+                        make_draft_sampler_capture_hook(self._domino_sampler)
+                    )
+            else:
+                self._draft_sampler = self._maybe_build_draft_sampler()
+                if self._draft_sampler is not None:
+                    self.draft_model_runner.capture_tail_hooks.append(
+                        make_draft_sampler_capture_hook(self._draft_sampler)
+                    )
         self._draft_worker.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
@@ -360,6 +369,40 @@ class DFlashWorkerV2(BaseSpecWorker):
             num_org=num_org,
             org_vocab_start=org_vocab_start,
             max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+        )
+
+    def _maybe_build_domino_sampler(self):
+        def _eager(reason):
+            if self.tp_rank == 0:
+                logger.info("DFLASH Domino rollout kept eager (reason=%s).", reason)
+            return None
+
+        if get_tp_group().world_size != 1:
+            return _eager("tp>1")
+        if self.block_size <= 1:
+            return _eager("block_size<=1")
+        target_model = self._target_worker.model_runner.model
+        lm_head = getattr(target_model, "lm_head", None)
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            return _eager("no target lm_head")
+        if not torch.is_floating_point(lm_head.weight):
+            # Quantized lm_head (FP8/INT) would break the static matmul.
+            return _eager("quantized lm_head")
+        if not hasattr(lm_head, "shard_indices"):
+            num_org = int(lm_head.weight.shape[0])
+            org_vocab_start = 0
+        else:
+            shard = lm_head.shard_indices
+            if int(shard.num_added_elements) != 0:
+                return _eager("added vocab")
+            num_org = int(shard.num_org_elements)
+            org_vocab_start = int(shard.org_vocab_start_index)
+        return self._domino_rollout.build_capture_sampler(
+            target_model=target_model,
+            lm_head=lm_head,
+            num_org=num_org,
+            org_vocab_start=org_vocab_start,
+            capture_bs_list=self.server_args.cuda_graph_config.decode.bs,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -1545,7 +1588,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._domino_rollout is None and self._draft_sampler is not None and draft_out.can_run_graph:
+        if (
+            self._domino_sampler is not None
+            and draft_out.can_run_graph
+            and bs <= self._domino_sampler.max_bs
+        ):
+            draft_next = self._domino_sampler.out[:bs]
+        elif self._domino_rollout is None and self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
