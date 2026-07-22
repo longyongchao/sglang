@@ -319,16 +319,18 @@ class FusedKVMaterializeHelper:
                     f"got (rotary_dim={layer_rotary_dim}, neox={layer_is_neox}) at layer {layer_id}."
                 )
 
-            qkv_w = attn.qkv_proj.weight
-            kv_weight = qkv_w[attn.q_size : attn.q_size + 2 * attn.kv_size]
+            kv_weight = self._get_layer_kv_weight(attn)
+            if int(kv_weight.shape[0]) != self.layer_out_dim:
+                raise ValueError(
+                    "Invalid KV projection weight shape for fused KV path: "
+                    f"got {tuple(kv_weight.shape)}, expected first dim "
+                    f"{self.layer_out_dim} at layer {layer_id}."
+                )
             kv_weights.append(kv_weight)
             k_norm_weights.append(attn.k_norm.weight)
             eps_values.append(float(attn.k_norm.variance_epsilon))
 
-        flat_kv_weight = torch.stack(kv_weights).reshape(
-            self.n_layers * self.layer_out_dim, -1
-        )
-        self.flat_kv_weight_t = flat_kv_weight.transpose(0, 1).contiguous()
+        self._init_projection_weights(kv_weights)
         self.k_norm_weights = torch.stack(k_norm_weights).contiguous()
         self.eps_values = torch.tensor(
             eps_values, dtype=torch.float32, device=self.device
@@ -336,6 +338,43 @@ class FusedKVMaterializeHelper:
 
         if self.max_position_hint is not None:
             self._ensure_rope_cache(self.max_position_hint)
+
+    @staticmethod
+    def _get_layer_kv_weight(attn) -> torch.Tensor:
+        qkv_w = attn.qkv_proj.weight
+        return qkv_w[attn.q_size : attn.q_size + 2 * attn.kv_size]
+
+    def _init_projection_weights(self, kv_weights: List[torch.Tensor]) -> None:
+        flat_kv_weight = torch.stack(kv_weights).reshape(
+            self.n_layers * self.layer_out_dim, -1
+        )
+        self.flat_kv_weight_t = flat_kv_weight.transpose(0, 1).contiguous()
+
+    @property
+    def _projection_dtype(self) -> torch.dtype:
+        return self.flat_kv_weight_t.dtype
+
+    def _validate_ctx_hidden(self, ctx_hidden: torch.Tensor) -> None:
+        expected_hidden_size = int(self.flat_kv_weight_t.shape[0])
+        if ctx_hidden.ndim != 2 or int(ctx_hidden.shape[1]) != expected_hidden_size:
+            raise ValueError(
+                "Invalid ctx_hidden shape for fused KV materialization: "
+                f"got {tuple(ctx_hidden.shape)}, expected [N, {expected_hidden_size}]."
+            )
+
+    def _project_ctx_hidden(
+        self, ctx_hidden: torch.Tensor, proj_out: torch.Tensor
+    ) -> torch.Tensor:
+        proj_out_2d = proj_out.view(ctx_hidden.shape[0], -1)
+        if self._mm_out_supported:
+            try:
+                torch.mm(ctx_hidden, self.flat_kv_weight_t, out=proj_out_2d)
+            except Exception:
+                self._mm_out_supported = False
+                proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight_t)
+        else:
+            proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight_t)
+        return proj_out_2d.view(ctx_hidden.shape[0], self.n_layers, self.layer_out_dim)
 
     def _ensure_rope_cache(self, max_position: int) -> torch.Tensor:
         if max_position + 1 > self._reserved_rope_cache_len:
@@ -393,6 +432,7 @@ class FusedKVMaterializeHelper:
         write_layer_kv: Callable[[int, torch.Tensor, torch.Tensor], None],
     ) -> None:
         """Materialize KV cache for all layers using batched projection."""
+        self._validate_ctx_hidden(ctx_hidden)
         total_ctx = ctx_hidden.shape[0]
         if total_ctx == 0:
             return
@@ -407,8 +447,8 @@ class FusedKVMaterializeHelper:
 
         if ctx_hidden.device != self.device:
             ctx_hidden = ctx_hidden.to(self.device, non_blocking=True)
-        if ctx_hidden.dtype != self.flat_kv_weight_t.dtype:
-            ctx_hidden = ctx_hidden.to(self.flat_kv_weight_t.dtype)
+        if ctx_hidden.dtype != self._projection_dtype:
+            ctx_hidden = ctx_hidden.to(self._projection_dtype)
         if positions.device != self.device:
             positions = positions.to(
                 device=self.device, dtype=torch.int64, non_blocking=True
@@ -428,17 +468,12 @@ class FusedKVMaterializeHelper:
         assert self._k_workspace is not None
         assert self._v_workspace is not None
 
-        proj_out_2d = self._proj_workspace[:total_ctx]
-        if self._mm_out_supported:
-            try:
-                torch.mm(ctx_hidden, self.flat_kv_weight_t, out=proj_out_2d)
-            except Exception:
-                self._mm_out_supported = False
-                proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight_t)
-        else:
-            proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight_t)
-
-        proj_out = proj_out_2d.view(total_ctx, self.n_layers, self.layer_out_dim)
+        proj_out = self._project_ctx_hidden(
+            ctx_hidden,
+            self._proj_workspace[:total_ctx].view(
+                total_ctx, self.n_layers, self.layer_out_dim
+            ),
+        )
         tmp_k = self._k_workspace[:, :total_ctx]
         tmp_v = self._v_workspace[:, :total_ctx]
         cache_k, cache_v = _fused_norm_rope_stacked(
@@ -455,3 +490,45 @@ class FusedKVMaterializeHelper:
         )
         for layer_idx in range(self.n_layers):
             write_layer_kv(layer_idx, cache_k[layer_idx], cache_v[layer_idx])
+
+
+class DFlareGroupedKVMaterializeHelper(FusedKVMaterializeHelper):
+    """DFlare KV materialization with per-layer context and K/V projections."""
+
+    @staticmethod
+    def _get_layer_kv_weight(attn) -> torch.Tensor:
+        return torch.cat((attn.k_proj_target.weight, attn.v_proj_target.weight), dim=0)
+
+    def _init_projection_weights(self, kv_weights: List[torch.Tensor]) -> None:
+        self.grouped_kv_weight_t = torch.stack(kv_weights).transpose(1, 2).contiguous()
+
+    @property
+    def _projection_dtype(self) -> torch.dtype:
+        return self.grouped_kv_weight_t.dtype
+
+    def _validate_ctx_hidden(self, ctx_hidden: torch.Tensor) -> None:
+        expected_hidden_size = int(self.grouped_kv_weight_t.shape[1])
+        expected_shape = (self.n_layers, expected_hidden_size)
+        if ctx_hidden.ndim != 3 or tuple(ctx_hidden.shape[1:]) != expected_shape:
+            raise ValueError(
+                "Invalid ctx_hidden shape for grouped DFlare KV materialization: "
+                f"got {tuple(ctx_hidden.shape)}, expected "
+                f"[N, {self.n_layers}, {expected_hidden_size}]."
+            )
+
+    def _project_ctx_hidden(
+        self, ctx_hidden: torch.Tensor, proj_out: torch.Tensor
+    ) -> torch.Tensor:
+        grouped_ctx_hidden = ctx_hidden.transpose(0, 1)
+        grouped_proj_out = proj_out.transpose(0, 1)
+        if self._mm_out_supported:
+            try:
+                torch.bmm(
+                    grouped_ctx_hidden,
+                    self.grouped_kv_weight_t,
+                    out=grouped_proj_out,
+                )
+                return proj_out
+            except Exception:
+                self._mm_out_supported = False
+        return torch.bmm(grouped_ctx_hidden, self.grouped_kv_weight_t).transpose(0, 1)

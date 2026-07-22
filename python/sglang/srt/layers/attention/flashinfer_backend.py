@@ -209,8 +209,8 @@ def fast_prefill_plan(
     max_q_len: int,
     max_kv_len: int,
 ) -> None:
-    """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
-    draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
+    """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for fixed-width
+    speculative prefill CUDA graphs (FlashInfer fa2, cuda-graph mode only).
 
     Upstream plan() always does qo/paged_kv/last_page_len ``.to("cpu")`` to build
     its host scheduling metadata, a blocking D2H that drains the GPU queue every
@@ -716,9 +716,21 @@ class FlashInferAttnBackend(AttentionBackend):
             for w in self.decode_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_decode_plan, w)
 
+        fixed_width_target_verify = (
+            forward_mode.is_target_verify()
+            and spec_info is not None
+            and getattr(spec_info, "num_tokens_per_req", None) is not None
+            and spec_info.num_tokens_per_req > 0
+            and getattr(spec_info, "ragged_verify_layout", None) is None
+            # Upstream plan() repacks custom masks on every replay. Until the
+            # fast path does the same, reusing its capture-time mask changes
+            # EAGLE tree attention semantics even when the mask shape is fixed.
+            and getattr(spec_info, "custom_mask", None) is None
+            and seq_lens_cpu is not None
+        )
         if (
             in_capture
-            and forward_mode.is_draft_extend_v2()
+            and (forward_mode.is_draft_extend_v2() or fixed_width_target_verify)
             and self.prefill_backend == "fa2"
             # Host-rebuilt layout only matches full attention (single wrapper);
             # SWA/cross-attn keep the plain plan().
@@ -727,7 +739,12 @@ class FlashInferAttnBackend(AttentionBackend):
             # Like decode: swap in fast_prefill_plan for replay, after the real
             # plan() above set up _cached_module (host metadata supplied per-replay
             # in call_begin_forward).
-            for w in self.draft_extend_cuda_graph_metadata[bs]:
+            wrappers = (
+                self.prefill_cuda_graph_metadata[bs]
+                if fixed_width_target_verify
+                else self.draft_extend_cuda_graph_metadata[bs]
+            )
+            for w in wrappers:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before

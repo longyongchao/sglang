@@ -52,10 +52,20 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+_DFlareGroupedKVMaterializeHelper = None
 
 
-def _get_fused_kv_materialize_helper():
-    global _FusedKVMaterializeHelper
+def _get_fused_kv_materialize_helper(*, grouped_context_kv: bool = False):
+    global _DFlareGroupedKVMaterializeHelper, _FusedKVMaterializeHelper
+    if grouped_context_kv:
+        if _DFlareGroupedKVMaterializeHelper is None:
+            from sglang.kernels.ops.speculative.fused_kv_materialize import (
+                DFlareGroupedKVMaterializeHelper,
+            )
+
+            _DFlareGroupedKVMaterializeHelper = DFlareGroupedKVMaterializeHelper
+        return _DFlareGroupedKVMaterializeHelper
+
     if _FusedKVMaterializeHelper is None:
         from sglang.kernels.ops.speculative.fused_kv_materialize import (
             FusedKVMaterializeHelper,
@@ -410,10 +420,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         try:
             layers = self.draft_model.layers
             fused_disable_reason: Optional[str] = None
+            supports_grouped_context_kv = bool(
+                getattr(self.draft_model, "supports_grouped_context_kv", False)
+            )
 
             if len(layers) == 0:
                 fused_disable_reason = "no layers found"
-            elif not getattr(self.draft_model, "supports_fused_context_kv", True):
+            elif not supports_grouped_context_kv and not getattr(
+                self.draft_model, "supports_fused_context_kv", True
+            ):
                 fused_disable_reason = "draft model does not support fused context KV"
 
             if fused_disable_reason is not None:
@@ -428,9 +443,20 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             for layer_idx, layer in enumerate(layers):
                 attn = layer.self_attn
-                eligible, reason = can_dflash_use_fused_qkv_proj(attn.qkv_proj)
-                if not eligible:
-                    fused_disable_reason = f"{reason}: layer={layer_idx}"
+                projection_names = (
+                    ("k_proj_target", "v_proj_target")
+                    if supports_grouped_context_kv
+                    else ("qkv_proj",)
+                )
+                for projection_name in projection_names:
+                    projection = getattr(attn, projection_name, None)
+                    eligible, reason = can_dflash_use_fused_qkv_proj(projection)
+                    if not eligible:
+                        fused_disable_reason = (
+                            f"{reason}: layer={layer_idx}, projection={projection_name}"
+                        )
+                        break
+                if fused_disable_reason is not None:
                     break
 
                 # Keep semantics aligned with set_kv_buffer scaling behavior.
@@ -469,11 +495,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._fused_kv_helper = None
                 return
 
-            FusedKVMaterializeHelper = _get_fused_kv_materialize_helper()
+            KVMaterializeHelper = _get_fused_kv_materialize_helper(
+                grouped_context_kv=supports_grouped_context_kv
+            )
             first_attn = layers[0].self_attn
             rotary_emb = first_attn.rotary_emb
 
-            self._fused_kv_helper = FusedKVMaterializeHelper(
+            self._fused_kv_helper = KVMaterializeHelper(
                 layers=layers,
                 rotary_emb=rotary_emb,
                 num_kv_heads=first_attn.num_kv_heads,

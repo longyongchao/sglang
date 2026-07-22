@@ -11,14 +11,20 @@ shared DFlash code and are not re-checked here.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
+from sglang.kernels.ops.speculative.fused_kv_materialize import (
+    DFlareGroupedKVMaterializeHelper,
+    _fused_norm_rope_stacked,
+)
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.models.dflare import DFlareDraftModel
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -112,8 +118,129 @@ class TestDFlareContextKV(CustomTestCase):
         cls.weights = _checkpoint_weights(generator)
         cls.model.load_weights(iter(cls.weights.items()))
 
+    def _make_fused_worker(self, projected_hidden):
+        class FakeGroupedHelper:
+            def __init__(self, num_layers):
+                self.num_layers = num_layers
+                self.ctx_hidden = None
+                self.positions = None
+                self.layer_kv = []
+
+            def materialize(self, *, ctx_hidden, positions, write_layer_kv):
+                self.ctx_hidden = ctx_hidden
+                self.positions = positions
+                for layer_idx in range(self.num_layers):
+                    cache_k = torch.full(
+                        (ctx_hidden.shape[0], 2), float(layer_idx + 1)
+                    )
+                    cache_v = torch.full(
+                        (ctx_hidden.shape[0], 2), float(10 + layer_idx)
+                    )
+                    self.layer_kv.append((cache_k, cache_v))
+                    write_layer_kv(layer_idx, cache_k, cache_v)
+
+        attns = [
+            SimpleNamespace(k_scale=0.25 + layer_idx, v_scale=0.5 + layer_idx)
+            for layer_idx in range(projected_hidden.shape[1])
+        ]
+        draft_model = SimpleNamespace(
+            supports_grouped_context_kv=True,
+            project_target_hidden=Mock(return_value=projected_hidden),
+            layers=[
+                SimpleNamespace(self_attn=SimpleNamespace(attn=attn))
+                for attn in attns
+            ],
+        )
+        token_to_kv_pool = SimpleNamespace(
+            set_kv_buffer=Mock(), set_kv_buffer_prefix_valid=Mock()
+        )
+        grouped_helper = FakeGroupedHelper(len(attns))
+
+        worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
+        worker.device = torch.device("cpu")
+        worker.model_runner = SimpleNamespace(device=worker.device)
+        worker.draft_model = draft_model
+        worker.draft_model_runner = SimpleNamespace(
+            token_to_kv_pool=token_to_kv_pool
+        )
+        worker._use_fused_kv_materialize = True
+        worker._fused_kv_helper = grouped_helper
+        return worker, draft_model, grouped_helper, token_to_kv_pool, attns
+
+    def test_grouped_fused_append_writes_committed_kv(self):
+        num_tokens, num_layers, hidden_size = 3, 2, 4
+        target_hidden = torch.randn(num_tokens, hidden_size)
+        projected_hidden = torch.randn(num_tokens, num_layers, hidden_size)
+        positions = torch.tensor([4, 5, 6], dtype=torch.int64)
+        cache_loc = torch.tensor([14, 15, 16], dtype=torch.int64)
+        worker, draft_model, helper, pool, attns = self._make_fused_worker(
+            projected_hidden
+        )
+
+        worker._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+        )
+
+        self.assertTrue(draft_model.supports_grouped_context_kv)
+        draft_model.project_target_hidden.assert_called_once_with(target_hidden)
+        self.assertEqual(helper.ctx_hidden.shape, (num_tokens, num_layers, hidden_size))
+        torch.testing.assert_close(helper.ctx_hidden, projected_hidden)
+        torch.testing.assert_close(helper.positions, positions)
+        self.assertEqual(pool.set_kv_buffer.call_count, num_layers)
+        pool.set_kv_buffer_prefix_valid.assert_not_called()
+        for layer_idx, call in enumerate(pool.set_kv_buffer.call_args_list):
+            cache_k, cache_v = helper.layer_kv[layer_idx]
+            self.assertIs(call.args[0], attns[layer_idx])
+            torch.testing.assert_close(call.args[1], cache_loc)
+            torch.testing.assert_close(call.args[2], cache_k)
+            torch.testing.assert_close(call.args[3], cache_v)
+            self.assertEqual(call.args[4], attns[layer_idx].k_scale)
+            self.assertEqual(call.args[5], attns[layer_idx].v_scale)
+
+    def test_grouped_fused_append_writes_prefix_valid_kv(self):
+        num_tokens, num_layers, hidden_size = 6, 2, 4
+        target_hidden = torch.randn(num_tokens, hidden_size)
+        projected_hidden = torch.randn(num_tokens, num_layers, hidden_size)
+        positions = torch.tensor([2, 3, 4, 8, 9, 10], dtype=torch.int64)
+        cache_loc_2d = torch.tensor([[20, 21, 22], [30, 31, 32]])
+        cache_loc = cache_loc_2d.flatten()
+        commit_lens = torch.tensor([2, 1], dtype=torch.int32)
+        worker, draft_model, helper, pool, attns = self._make_fused_worker(
+            projected_hidden
+        )
+
+        worker._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
+
+        self.assertTrue(draft_model.supports_grouped_context_kv)
+        draft_model.project_target_hidden.assert_called_once_with(target_hidden)
+        self.assertEqual(helper.ctx_hidden.shape, (num_tokens, num_layers, hidden_size))
+        torch.testing.assert_close(helper.ctx_hidden, projected_hidden)
+        torch.testing.assert_close(helper.positions, positions)
+        self.assertEqual(pool.set_kv_buffer_prefix_valid.call_count, num_layers)
+        pool.set_kv_buffer.assert_not_called()
+        for layer_idx, call in enumerate(
+            pool.set_kv_buffer_prefix_valid.call_args_list
+        ):
+            cache_k, cache_v = helper.layer_kv[layer_idx]
+            self.assertIs(call.args[0], attns[layer_idx])
+            torch.testing.assert_close(call.args[1], cache_loc_2d)
+            torch.testing.assert_close(call.args[2], commit_lens)
+            torch.testing.assert_close(call.args[3], cache_k)
+            torch.testing.assert_close(call.args[4], cache_v)
+            self.assertEqual(call.args[5], attns[layer_idx].k_scale)
+            self.assertEqual(call.args[6], attns[layer_idx].v_scale)
+
     def test_model_structure(self):
         self.assertFalse(self.model.supports_fused_context_kv)
+        self.assertTrue(self.model.supports_grouped_context_kv)
         self.assertFalse(hasattr(self.model, "fc"))
         state_dict = self.model.state_dict()
         self.assertIn("layer_fusion_weights", state_dict)
@@ -130,6 +257,137 @@ class TestDFlareContextKV(CustomTestCase):
             dim=0,
         )
         torch.testing.assert_close(qkv, expected_qkv)
+
+    def test_grouped_projection_matches_per_layer_projections(self):
+        num_tokens = 5
+        ctx_hidden = torch.randn(num_tokens, NUM_DRAFT_LAYERS, HIDDEN_SIZE)
+        first_attn = self.model.layers[0].self_attn
+        helper = DFlareGroupedKVMaterializeHelper(
+            layers=self.model.layers,
+            rotary_emb=first_attn.rotary_emb,
+            num_kv_heads=first_attn.num_kv_heads,
+            head_dim=first_attn.head_dim,
+            device=torch.device("cpu"),
+        )
+        helper._ensure_workspace(num_tokens, ctx_hidden.dtype)
+        proj_out = helper._project_ctx_hidden(
+            ctx_hidden,
+            helper._proj_workspace[:num_tokens].view(num_tokens, NUM_DRAFT_LAYERS, -1),
+        )
+
+        for layer_idx, layer in enumerate(self.model.layers):
+            k, v = layer.self_attn.kv_proj_only(ctx_hidden[:, layer_idx])
+            torch.testing.assert_close(
+                proj_out[:, layer_idx], torch.cat((k, v), dim=-1)
+            )
+
+        with self.assertRaisesRegex(ValueError, "Invalid ctx_hidden shape"):
+            helper._validate_ctx_hidden(ctx_hidden[:, 0])
+
+    def test_empty_grouped_materialize_skips_callback(self):
+        first_attn = self.model.layers[0].self_attn
+        helper = DFlareGroupedKVMaterializeHelper(
+            layers=self.model.layers,
+            rotary_emb=first_attn.rotary_emb,
+            num_kv_heads=first_attn.num_kv_heads,
+            head_dim=first_attn.head_dim,
+            device=torch.device("cpu"),
+        )
+
+        def unexpected_write(*args):
+            self.fail(f"write callback invoked with {args}")
+
+        helper.materialize(
+            torch.empty(0, NUM_DRAFT_LAYERS, HIDDEN_SIZE),
+            torch.empty(0, dtype=torch.long),
+            unexpected_write,
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_fused_norm_rope_stacked_cuda(self):
+        num_tokens, num_layers = 4, 3
+        num_kv_heads, head_dim, rotary_dim = 2, 8, 6
+        kv_size = num_kv_heads * head_dim
+        positions = torch.tensor([7, 1, 9, 4], device="cuda")
+
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                generator = torch.Generator(device="cuda").manual_seed(123)
+                kv = torch.randn(
+                    num_tokens,
+                    num_layers,
+                    2 * kv_size,
+                    device="cuda",
+                    dtype=dtype,
+                    generator=generator,
+                )
+                weights = torch.randn(
+                    num_layers,
+                    head_dim,
+                    device="cuda",
+                    dtype=dtype,
+                    generator=generator,
+                )
+                eps = torch.tensor([1e-6, 2e-5, 1e-4], device="cuda")
+                angles = torch.randn(
+                    12,
+                    rotary_dim // 2,
+                    device="cuda",
+                    dtype=torch.float32,
+                    generator=generator,
+                )
+                cos_sin_cache = torch.cat((angles.cos(), angles.sin()), dim=-1)
+
+                actual_k, actual_v = _fused_norm_rope_stacked(
+                    kv,
+                    weights,
+                    eps,
+                    cos_sin_cache,
+                    positions,
+                    num_kv_heads,
+                    head_dim,
+                    rotary_dim,
+                )
+
+                reference_k = []
+                reference_v = []
+                cos, sin = cos_sin_cache[positions].chunk(2, dim=-1)
+                for layer_id in range(num_layers):
+                    k = kv[:, layer_id, :kv_size].view(
+                        num_tokens, num_kv_heads, head_dim
+                    )
+                    k32 = k.float()
+                    k32 = k32 * torch.rsqrt(
+                        k32.square().mean(dim=-1, keepdim=True) + eps[layer_id]
+                    )
+                    k32 = k32 * weights[layer_id].float()
+                    first, second = k32[..., :rotary_dim].chunk(2, dim=-1)
+                    rotated = torch.cat(
+                        (
+                            first * cos[:, None] - second * sin[:, None],
+                            second * cos[:, None] + first * sin[:, None],
+                            k32[..., rotary_dim:],
+                        ),
+                        dim=-1,
+                    )
+                    reference_k.append(rotated.to(dtype))
+                    reference_v.append(
+                        kv[:, layer_id, kv_size:].view(
+                            num_tokens, num_kv_heads, head_dim
+                        )
+                    )
+
+                atol, rtol = (
+                    (2e-3, 2e-3)
+                    if dtype == torch.float16
+                    else (2e-2, 2e-2)
+                )
+                torch.testing.assert_close(
+                    actual_k, torch.stack(reference_k), atol=atol, rtol=rtol
+                )
+                torch.testing.assert_close(
+                    actual_v, torch.stack(reference_v), atol=0, rtol=0
+                )
 
     def test_dflash_base_hook_is_identity(self):
         ctx_hidden = torch.randn(3, HIDDEN_SIZE)
