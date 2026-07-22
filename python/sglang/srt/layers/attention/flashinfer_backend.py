@@ -722,6 +722,10 @@ class FlashInferAttnBackend(AttentionBackend):
             and getattr(spec_info, "num_tokens_per_req", None) is not None
             and spec_info.num_tokens_per_req > 0
             and getattr(spec_info, "ragged_verify_layout", None) is None
+            # Upstream plan() repacks custom masks on every replay. Until the
+            # fast path does the same, reusing its capture-time mask changes
+            # EAGLE tree attention semantics even when the mask shape is fixed.
+            and getattr(spec_info, "custom_mask", None) is None
             and seq_lens_cpu is not None
         )
         if (

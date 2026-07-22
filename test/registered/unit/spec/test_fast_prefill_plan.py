@@ -100,6 +100,18 @@ class TestFastPrefillPlanInstallation(CustomTestCase):
         self.assertIs(wrapper.begin_forward.func, fast_prefill_plan)
         self.assertIs(wrapper.begin_forward.args[0], wrapper)
 
+    def test_custom_mask_target_verify_keeps_normal_plan(self):
+        wrapper, original = self._run_capture(
+            seq_lens_cpu=torch.tensor([7, 11], dtype=torch.int32),
+            spec_info=SimpleNamespace(
+                num_tokens_per_req=4,
+                ragged_verify_layout=None,
+                custom_mask=torch.ones(8, dtype=torch.bool),
+            ),
+        )
+
+        self.assertIs(wrapper.begin_forward, original)
+
     def test_ineligible_target_verify_keeps_normal_plan(self):
         cases = (
             (torch.tensor([7, 11]), None, "fa2", None),
