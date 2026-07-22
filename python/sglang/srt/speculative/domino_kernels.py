@@ -239,8 +239,8 @@ def _domino_fused_silu_fc2_candidate_argmax_kernel(
         acc += bias_block
 
     base_block = tl.load(
-        base_ptr + pid_b * stride_base_b + cand_idx * stride_base_v,
-        mask=cand_valid, other=-float("inf"),
+        base_ptr + pid_b * stride_base_b + offs_c * stride_base_v,
+        mask=mask_c, other=-float("inf"),
         cache_modifier=".cg",
     ).to(tl.float32)
     acc += base_block
@@ -281,7 +281,7 @@ def fused_silu_fc2_argmax(
     Writes the per-batch global argmax into ``final_token`` in-place.
     """
     B, M = z_proj.shape
-    V = base_logits.shape[1]
+    V = fc2_weight.shape[0]
     num_v_blocks = (V + block_v - 1) // block_v
     has_fc2_bias = fc2_bias is not None
     fc2_bias_arg = fc2_bias if has_fc2_bias else out_val  # placeholder ptr
@@ -333,7 +333,7 @@ def fused_silu_fc2_argmax_with_value(
 ) -> None:
     """Fused full-shard scoring that also returns the local max score."""
     B, M = z_proj.shape
-    V = base_logits.shape[1]
+    V = fc2_weight.shape[0]
     num_v_blocks = (V + block_v - 1) // block_v
     has_fc2_bias = fc2_bias is not None
     fc2_bias_arg = fc2_bias if has_fc2_bias else out_val
@@ -375,8 +375,8 @@ def fused_silu_fc2_candidate_argmax(
     s_proj: torch.Tensor,        # [B, M]
     fc2_weight: torch.Tensor,    # [V, M]
     fc2_bias: torch.Tensor | None,  # [V] or None
-    base_logits: torch.Tensor,   # [B, V]
-    candidate_ids: torch.Tensor, # [B, C] local vocab ids into fc2/base_logits
+    base_logits: torch.Tensor,   # [B, C], ordered like candidate_ids
+    candidate_ids: torch.Tensor, # [B, C] local vocab ids into fc2
     out_val: torch.Tensor,       # [B, num_candidate_blocks] fp32 scratch
     out_idx: torch.Tensor,       # [B, num_candidate_blocks] int32 scratch
     final_token: torch.Tensor,   # [B] int64 destination, local vocab ids
@@ -391,7 +391,7 @@ def fused_silu_fc2_candidate_argmax(
     output token ids are local ids, matching ``fused_silu_fc2_argmax`` semantics.
     """
     B, M = z_proj.shape
-    V = base_logits.shape[1]
+    V = fc2_weight.shape[0]
     C = candidate_ids.shape[1]
     num_c_blocks = (C + block_c - 1) // block_c
     has_fc2_bias = fc2_bias is not None
@@ -433,8 +433,8 @@ def fused_silu_fc2_candidate_argmax_with_value(
     s_proj: torch.Tensor,        # [B, M]
     fc2_weight: torch.Tensor,    # [V, M]
     fc2_bias: torch.Tensor | None,  # [V] or None
-    base_logits: torch.Tensor,   # [B, V]
-    candidate_ids: torch.Tensor, # [B, C] local vocab ids into fc2/base_logits
+    base_logits: torch.Tensor,   # [B, C], ordered like candidate_ids
+    candidate_ids: torch.Tensor, # [B, C] local vocab ids into fc2
     out_val: torch.Tensor,       # [B, num_candidate_blocks] fp32 scratch
     out_idx: torch.Tensor,       # [B, num_candidate_blocks] int32 scratch
     final_token: torch.Tensor,   # [B] int64 destination, local vocab ids
@@ -446,7 +446,7 @@ def fused_silu_fc2_candidate_argmax_with_value(
 ) -> None:
     """Candidate-restricted fused scoring that also returns the local max score."""
     B, M = z_proj.shape
-    V = base_logits.shape[1]
+    V = fc2_weight.shape[0]
     C = candidate_ids.shape[1]
     num_c_blocks = (C + block_c - 1) // block_c
     has_fc2_bias = fc2_bias is not None

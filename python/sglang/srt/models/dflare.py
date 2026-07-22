@@ -83,10 +83,9 @@ class DFlareDecoderLayer(DFlashDecoderLayer):
 
 
 class DFlareDraftModel(DFlashDraftModel):
-    # The fused KV materialization kernel assumes one shared ctx hidden and
-    # slices K/V weights from qkv_proj; neither holds for DFlare. The worker
-    # reads this flag and falls back to the per-layer eager path.
+    # DFlare uses one context hidden and dedicated K/V projections per layer.
     supports_fused_context_kv = False
+    supports_grouped_context_kv = True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
