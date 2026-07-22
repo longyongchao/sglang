@@ -240,10 +240,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_tp_gathered_max_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_tp_gathered_ids_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_gathered_packed_buf: Optional[torch.Tensor] = None
-        self._draft_greedy_packed_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gather_cap: int = 0
         self._draft_greedy_local_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_local_arg_buf: Optional[torch.Tensor] = None
@@ -752,92 +748,37 @@ class DFlashWorkerV2(BaseSpecWorker):
         local_logits: torch.Tensor,
         local_vocab_start: int,
         local_token_ids: Optional[torch.Tensor] = None,
-        global_vocab_size: Optional[int] = None,
     ) -> torch.Tensor:
         local_max, local_arg = torch.max(local_logits, dim=-1)
         if local_token_ids is None:
             global_ids = local_arg.to(torch.int64) + int(local_vocab_start)
         else:
             global_ids = torch.gather(local_token_ids, -1, local_arg.unsqueeze(-1)).squeeze(-1)
-        return self._global_argmax_from_local_max(
-            local_max=local_max,
-            global_ids=global_ids,
-            global_vocab_size=global_vocab_size,
-        )
+        tp_group = get_tp_group()
+        if int(tp_group.world_size) == 1:
+            return global_ids
+        batch = int(local_logits.shape[0])
+        gathered_max = torch.empty((int(tp_group.world_size), batch), dtype=local_max.dtype, device=local_max.device)
+        gathered_ids = torch.empty((int(tp_group.world_size), batch), dtype=torch.int64, device=global_ids.device)
+        tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
+        tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
+        best_rank = torch.argmax(gathered_max, dim=0)
+        return torch.gather(gathered_ids, 0, best_rank.unsqueeze(0)).squeeze(0)
 
     def _global_argmax_from_local_max(
         self,
         *,
         local_max: torch.Tensor,
         global_ids: torch.Tensor,
-        global_vocab_size: Optional[int] = None,
     ) -> torch.Tensor:
         tp_group = get_tp_group()
-        world_size = int(tp_group.world_size)
-        if world_size == 1:
+        if int(tp_group.world_size) == 1:
             return global_ids
         batch = int(local_max.shape[0])
-        use_packed = (
-            global_vocab_size is not None
-            and 0 < int(global_vocab_size) < (1 << 24)
-        )
-        if use_packed:
-            # FP32 represents every token ID below 2**24 exactly. Keep the
-            # rank-first argmax below unchanged so ties retain prior behavior.
-            assert int(global_vocab_size) < (1 << 24)
-            packed = self.__dict__.get("_draft_greedy_packed_buf")
-            gathered = self.__dict__.get("_draft_greedy_gathered_packed_buf")
-            if (
-                packed is None
-                or gathered is None
-                or packed.shape[0] < batch
-                or gathered.shape[0] < world_size * batch
-                or packed.device != local_max.device
-            ):
-                packed = torch.empty((batch, 2), dtype=torch.float32, device=local_max.device)
-                gathered = torch.empty(
-                    (world_size * batch, 2), dtype=torch.float32, device=local_max.device
-                )
-                self._draft_greedy_packed_buf = packed
-                self._draft_greedy_gathered_packed_buf = gathered
-            packed = packed[:batch]
-            gathered = gathered[: world_size * batch]
-            packed[:, 0].copy_(local_max.to(torch.float32))
-            packed[:, 1].copy_(global_ids.to(torch.float32))
-            tp_group.all_gather_into_tensor(gathered, packed)
-            gathered = gathered.view(world_size, batch, 2)
-            best_rank = torch.argmax(gathered[:, :, 0], dim=0)
-            return torch.gather(
-                gathered[:, :, 1], 0, best_rank.unsqueeze(0)
-            ).squeeze(0).to(torch.int64)
-
-        gathered_max = self.__dict__.get("_draft_greedy_tp_gathered_max_buf")
-        gathered_ids = self.__dict__.get("_draft_greedy_tp_gathered_ids_buf")
-        if (
-            gathered_max is None
-            or gathered_ids is None
-            or gathered_max.ndim != 1
-            or gathered_ids.ndim != 1
-            or gathered_max.shape[0] < world_size * batch
-            or gathered_ids.shape[0] < world_size * batch
-            or gathered_max.device != local_max.device
-            or gathered_ids.device != global_ids.device
-            or gathered_max.dtype != local_max.dtype
-        ):
-            gathered_max = torch.empty(
-                (world_size * batch,), dtype=local_max.dtype, device=local_max.device
-            )
-            gathered_ids = torch.empty(
-                (world_size * batch,), dtype=torch.int64, device=global_ids.device
-            )
-            self._draft_greedy_tp_gathered_max_buf = gathered_max
-            self._draft_greedy_tp_gathered_ids_buf = gathered_ids
-        gathered_max = gathered_max[: world_size * batch]
-        gathered_ids = gathered_ids[: world_size * batch]
+        gathered_max = torch.empty((int(tp_group.world_size), batch), dtype=local_max.dtype, device=local_max.device)
+        gathered_ids = torch.empty((int(tp_group.world_size), batch), dtype=torch.int64, device=global_ids.device)
         tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
         tp_group.all_gather_into_tensor(gathered_ids, global_ids.to(torch.int64).contiguous())
-        gathered_max = gathered_max.view(world_size, batch)
-        gathered_ids = gathered_ids.view(world_size, batch)
         best_rank = torch.argmax(gathered_max, dim=0)
         return torch.gather(gathered_ids, 0, best_rank.unsqueeze(0)).squeeze(0)
 

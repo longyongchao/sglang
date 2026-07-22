@@ -22,94 +22,7 @@ _DOMINO_SCORE_NUM_WARPS = 4
 _DOMINO_SCORE_NUM_STAGES = 3
 _DOMINO_CANDIDATE_BLOCK_C = 512
 _DOMINO_CANDIDATE_POOL_SIZE = 2048
-_DOMINO_CANDIDATE_VOCAB_CHUNK = 4096
 _DOMINO_TP_SCORER_CUSHION_MB = 2048
-
-
-def _domino_fold_candidate_logits(
-    z: torch.Tensor,
-    weight: torch.Tensor,
-    candidate_pool_size: int,
-    org_vocab_start: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fold candidate-mode logits without materializing the vocab dimension."""
-    bs, num_draft, _ = z.shape
-    vocab_size = int(weight.shape[0])
-    chunk = _DOMINO_CANDIDATE_VOCAB_CHUNK
-    pool_values = torch.full(
-        (bs, candidate_pool_size), -float("inf"), dtype=z.dtype, device=z.device
-    )
-    pool_ids = torch.zeros((bs, candidate_pool_size), dtype=torch.long, device=z.device)
-    slot_values = torch.full((bs,), -float("inf"), dtype=z.dtype, device=z.device)
-    slot_ids = torch.zeros((bs,), dtype=torch.long, device=z.device)
-    proposal = slice(1, None) if num_draft > 1 else slice(0, 1)
-    for start in range(0, vocab_size, chunk):
-        end = min(start + chunk, vocab_size)
-        chunk_logits = torch.matmul(
-            z.reshape(bs * num_draft, -1), weight[start:end].T
-        ).view(bs, num_draft, end - start)
-        local_slot = torch.argmax(chunk_logits[:, 0, :], dim=-1)
-        local_value = torch.gather(
-            chunk_logits[:, 0, :], 1, local_slot[:, None]
-        ).squeeze(1)
-        take = local_value > slot_values
-        slot_values = torch.where(take, local_value, slot_values)
-        slot_ids = torch.where(take, local_slot + start, slot_ids)
-
-        chunk_pool = chunk_logits[:, proposal, :].max(dim=1).values
-        local_k = min(candidate_pool_size, end - start)
-        local_order = torch.argsort(chunk_pool, dim=-1, descending=True, stable=True)[
-            :, :local_k
-        ]
-        local_values = torch.gather(chunk_pool, 1, local_order)
-        local_ids = local_order + start
-        merged_values = torch.cat((pool_values, local_values), dim=-1)
-        merged_ids = torch.cat((pool_ids, local_ids), dim=-1)
-        order = torch.argsort(merged_values, dim=-1, descending=True, stable=True)[
-            :, :candidate_pool_size
-        ]
-        pool_values = torch.gather(merged_values, 1, order)
-        pool_ids = torch.gather(merged_ids, 1, order)
-
-    compact = torch.empty(
-        (bs, num_draft, candidate_pool_size), dtype=z.dtype, device=z.device
-    )
-    for start in range(0, vocab_size, chunk):
-        end = min(start + chunk, vocab_size)
-        chunk_logits = torch.matmul(
-            z.reshape(bs * num_draft, -1), weight[start:end].T
-        ).view(bs, num_draft, end - start)
-        in_chunk = (pool_ids >= start) & (pool_ids < end)
-        safe_ids = (pool_ids - start).clamp(0, end - start - 1)
-        gathered = torch.gather(
-            chunk_logits,
-            2,
-            safe_ids[:, None, :].expand(bs, num_draft, candidate_pool_size),
-        )
-        compact = torch.where(in_chunk[:, None, :], gathered, compact)
-
-    return (
-        compact,
-        pool_ids,
-        slot_values,
-        (slot_ids + int(org_vocab_start)).to(torch.long),
-    )
-
-
-def _domino_fold_per_bs_bytes(
-    num_draft: int,
-    vocab_size: int,
-    candidate_pool_size: int,
-    element_size: int,
-) -> int:
-    logits_width = int(vocab_size)
-    if candidate_pool_size > 0:
-        logits_width = min(int(vocab_size), _DOMINO_CANDIDATE_VOCAB_CHUNK) + int(
-            candidate_pool_size
-        )
-    return int(num_draft) * logits_width * int(element_size)
-
-
 _DOMINO_TP_GRU_TABLE_CUSHION_MB = 1024
 _DOMINO_FOLD_LOGITS_BUDGET_MB = 128
 
@@ -190,51 +103,21 @@ class DFlashDominoRollout:
         )
 
         z_for_dtype = z.to(weight_dtype) if z.dtype != weight_dtype else z
-        score_weight = (
-            full_lm_head_weight if use_replicated_scorer else weight[:num_org]
-        )
+        score_weight = full_lm_head_weight if use_replicated_scorer else weight[:num_org]
         score_vocab_size = valid_vocab_size if use_replicated_scorer else num_org
-        candidate_pool_size = self._resolve_domino_candidate_pool_size(
-            score_vocab_size,
-            warn_on_disable=False,
-        )
-        candidate_ids = None
-        if candidate_pool_size > 0 and num_draft > 1:
-            (
-                base_logits,
-                candidate_ids,
-                slot_local_value,
-                slot_local_id,
-            ) = _domino_fold_candidate_logits(
-                z_for_dtype,
-                score_weight,
-                candidate_pool_size,
-                0 if use_replicated_scorer else org_vocab_start,
-            )
-            slot_1 = (
-                slot_local_id
-                if use_replicated_scorer
-                else self.global_argmax_from_local_max(
-                    local_max=slot_local_value,
-                    global_ids=slot_local_id,
-                    global_vocab_size=valid_vocab_size,
-                )
-            )
-        else:
-            base_logits = torch.matmul(
-                z_for_dtype.reshape(bs * num_draft, hidden_size),
-                score_weight.T,
-            ).view(bs, num_draft, score_vocab_size)
-            if use_replicated_scorer:
-                slot_1 = torch.argmax(base_logits[:, 0, :], dim=-1).to(torch.long)
-            else:
-                slot_1 = self.global_argmax_from_local_logits(
-                    local_logits=base_logits[:, 0, :],
-                    local_vocab_start=org_vocab_start,
-                    global_vocab_size=valid_vocab_size,
-                )
+        base_logits = torch.matmul(
+            z_for_dtype.reshape(bs * num_draft, hidden_size),
+            score_weight.T,
+        ).view(bs, num_draft, score_vocab_size)
 
         out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
+        if use_replicated_scorer:
+            slot_1 = torch.argmax(base_logits[:, 0, :], dim=-1).to(torch.long)
+        else:
+            slot_1 = self.global_argmax_from_local_logits(
+                local_logits=base_logits[:, 0, :],
+                local_vocab_start=org_vocab_start,
+            )
         out[:, 0].copy_(slot_1)
 
         gru_h = self._init_domino_prefix_gru_hidden(
@@ -261,11 +144,21 @@ class DFlashDominoRollout:
                 start=org_vocab_start,
                 length=num_org,
             )
+        candidate_pool_size = self._resolve_domino_candidate_pool_size(
+            score_vocab_size,
+            warn_on_disable=False,
+        )
         use_fused_score = z.is_cuda
+        candidate_ids = None
         candidate_token_ids = None
         candidate_fc2_w = None
         candidate_fc2_b = None
-        if candidate_ids is not None:
+        if candidate_pool_size > 0 and num_draft > 1:
+            pool_source = base_logits[:, 1:, :]
+            pool_logits = pool_source.max(dim=1).values
+            candidate_ids = torch.topk(
+                pool_logits, k=candidate_pool_size, dim=-1
+            ).indices.contiguous()
             if not use_fused_score:
                 candidate_token_ids = candidate_ids.to(torch.int64)
                 if not use_replicated_scorer:
@@ -390,7 +283,6 @@ class DFlashDominoRollout:
                     tok = self.global_argmax_from_local_max(
                         local_max=local_val_buf,
                         global_ids=local_tok_buf.to(torch.int64) + int(org_vocab_start),
-                        global_vocab_size=valid_vocab_size,
                     )
             elif candidate_ids is None:
                 mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
@@ -402,16 +294,20 @@ class DFlashDominoRollout:
                     tok = self.global_argmax_from_local_logits(
                         local_logits=logits_k,
                         local_vocab_start=org_vocab_start,
-                        global_vocab_size=valid_vocab_size,
                     )
             else:
                 assert candidate_fc2_w is not None
                 assert candidate_token_ids is not None
                 mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
-                bias_local = torch.bmm(candidate_fc2_w, mid.unsqueeze(-1)).squeeze(-1)
+                bias_local = torch.bmm(
+                    candidate_fc2_w, mid.unsqueeze(-1)
+                ).squeeze(-1)
                 if candidate_fc2_b is not None:
                     bias_local = bias_local + candidate_fc2_b
-                logits_k = base_logits[:, k, :] + bias_local.to(base_logits.dtype)
+                logits_k = (
+                    torch.gather(base_logits[:, k, :], 1, candidate_ids)
+                    + bias_local.to(base_logits.dtype)
+                )
                 if use_replicated_scorer:
                     local_arg = torch.argmax(logits_k, dim=-1)
                     tok = torch.gather(
@@ -983,15 +879,11 @@ class DFlashDominoRollout:
             return entry
 
         G = gru_hidden
-        z_proj_buf = torch.empty((bs, num_draft, emb_dim), dtype=z_dtype, device=device)
+        z_proj_buf = torch.empty(
+            (bs, num_draft, emb_dim), dtype=z_dtype, device=device
+        )
         base_logits_buf = torch.empty(
-            (
-                bs,
-                num_draft,
-                candidate_pool_size if use_candidate_pool else num_org,
-            ),
-            dtype=logits_dtype,
-            device=device,
+            (bs, num_draft, num_org), dtype=logits_dtype, device=device
         )
         gru_h_buf = torch.empty((bs, G), dtype=z_dtype, device=device)
         out_buf = torch.empty((bs, num_draft), dtype=torch.long, device=device)
@@ -1125,21 +1017,10 @@ class DFlashDominoRollout:
         # fall back to the eager rollout path. Snap the cap to an actually
         # captured batch size so any replayed graph serving bs <= fold_max_bs
         # is guaranteed to contain the folded rollout.
-        candidate_pool_size = self._resolve_domino_candidate_pool_size(
-            int(num_org),
-            warn_on_disable=True,
-        )
-        per_bs_bytes = _domino_fold_per_bs_bytes(
-            num_draft,
-            int(num_org),
-            candidate_pool_size,
-            lm_head.weight.element_size(),
-        )
+        per_bs_bytes = num_draft * int(num_org) * lm_head.weight.element_size()
         budget_bytes = _DOMINO_FOLD_LOGITS_BUDGET_MB * 1024 * 1024
         budget_max_bs = budget_bytes // per_bs_bytes
-        fold_bs_candidates = [
-            int(b) for b in capture_bs_list if int(b) <= budget_max_bs
-        ]
+        fold_bs_candidates = [int(b) for b in capture_bs_list if int(b) <= budget_max_bs]
         if not fold_bs_candidates:
             logger.warning(
                 "[DFLASH Domino] rollout fold disabled: base_logits budget "
@@ -1152,6 +1033,10 @@ class DFlashDominoRollout:
         embed_module = target_model.get_input_embeddings()
         gru_input_table = self.domino_helper.get_gru_input_proj_table(
             embed_module.weight
+        )
+        candidate_pool_size = self._resolve_domino_candidate_pool_size(
+            int(num_org),
+            warn_on_disable=True,
         )
         logger.info(
             "[DFLASH Domino] rollout folded into the draft cuda graph "
@@ -1275,20 +1160,29 @@ class DFlashDominoRollout:
         G = state["gru_hidden_size"]
         emb_dim = int(state["w_z"].shape[0])
         z_for_dtype = z.to(weight.dtype) if z.dtype != weight.dtype else z
-        gru_input_table = domino_helper.get_gru_input_proj_table(embed_module.weight)
+        gru_input_table = domino_helper.get_gru_input_proj_table(
+            embed_module.weight
+        )
 
         # Original eager-prologue path.
+        z_flat = z_for_dtype.reshape(bs * num_draft, hidden_size)
+        base_logits = torch.matmul(z_flat, weight[:num_org].T).view(
+            bs, num_draft, num_org
+        )
+
+        candidate_ids = None
         if candidate_pool_size > 0:
-            base_logits, candidate_ids, _, slot_1 = _domino_fold_candidate_logits(
-                z_for_dtype, weight[:num_org], candidate_pool_size, org_vocab_start
+            pool_source = (
+                base_logits[:, 1:, :]
+                if int(base_logits.shape[1]) > 1 else base_logits[:, :1, :]
             )
-        else:
-            z_flat = z_for_dtype.reshape(bs * num_draft, hidden_size)
-            base_logits = torch.matmul(z_flat, weight[:num_org].T).view(
-                bs, num_draft, num_org
-            )
-            slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
-            slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
+            pool_logits = pool_source.max(dim=1).values
+            candidate_ids = torch.topk(
+                pool_logits, k=candidate_pool_size, dim=-1
+            ).indices.contiguous()
+
+        slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
+        slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
 
         gru_h = self._init_domino_prefix_gru_hidden(
             prefix_ids=torch.stack([bonus_tokens.to(torch.long), slot_1], dim=1),
@@ -1398,22 +1292,24 @@ class DominoDraftSampler:
             z = hidden[:, 1:, :].contiguous()
         z_score = z.to(self.weight.dtype) if z.dtype != self.weight.dtype else z
 
+        base_logits = torch.matmul(
+            z_score.reshape(bs * num_draft, z_score.shape[-1]),
+            self.weight[: self.num_org].T,
+        ).view(bs, num_draft, self.num_org)
+
         candidate_ids = None
         if self.candidate_pool_size > 0:
-            base_logits, candidate_ids, _, slot_1 = _domino_fold_candidate_logits(
-                z_score,
-                self.weight[: self.num_org],
-                self.candidate_pool_size,
-                self.org_vocab_start,
+            pool_source = (
+                base_logits[:, 1:, :] if num_draft > 1 else base_logits[:, :1, :]
             )
-        else:
-            base_logits = torch.matmul(
-                z_score.reshape(bs * num_draft, z_score.shape[-1]),
-                self.weight[: self.num_org].T,
-            ).view(bs, num_draft, self.num_org)
-            slot_1 = (
-                torch.argmax(base_logits[:, 0, :], dim=-1) + self.org_vocab_start
-            ).to(torch.long)
+            pool_logits = pool_source.max(dim=1).values
+            candidate_ids = torch.topk(
+                pool_logits, k=self.candidate_pool_size, dim=-1
+            ).indices.contiguous()
+
+        slot_1 = (
+            torch.argmax(base_logits[:, 0, :], dim=-1) + self.org_vocab_start
+        ).to(torch.long)
         bonus_tokens = input_ids.view(bs, self.block_size)[:bs, 0].to(torch.long)
 
         gru_h = rollout._init_domino_prefix_gru_hidden(
