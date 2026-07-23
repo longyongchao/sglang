@@ -104,7 +104,19 @@ def renorm_draft_probs(
     """
     if not use_rejection_sampling or not next_token_logits.size(0):
         return torch.softmax(next_token_logits, dim=-1)
-    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+
+    temperatures = sampling_info.temperatures
+    if next_token_logits.size(0) != temperatures.size(0):
+        if next_token_logits.size(0) % temperatures.size(0) != 0:
+            raise ValueError(
+                "Draft logits batch size must be a multiple of the sampling "
+                "temperature batch size, got "
+                f"{next_token_logits.size(0)} and {temperatures.size(0)}."
+            )
+        temperatures = temperatures.repeat_interleave(
+            next_token_logits.size(0) // temperatures.size(0), dim=0
+        )
+    return torch.softmax(next_token_logits / temperatures, dim=-1)
 
 
 def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):

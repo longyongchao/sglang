@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+from sglang.srt.speculative.spec_utils import renorm_draft_probs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -70,6 +71,34 @@ class TestEagleRejectionModes(CustomTestCase):
             seq_lens=torch.ones(1, dtype=torch.int32), sampling_info=SimpleNamespace()
         )
         return logits, output, next_input, result, batch
+
+    def test_tree_rejection_scales_each_branch_by_request_temperature(self):
+        logits = torch.tensor(
+            [
+                [2.0, 0.0],
+                [4.0, 0.0],
+                [6.0, 0.0],
+                [2.0, 0.0],
+                [4.0, 0.0],
+                [6.0, 0.0],
+            ]
+        )
+        sampling_info = SimpleNamespace(temperatures=torch.tensor([[1.0], [2.0]]))
+
+        actual = renorm_draft_probs(logits, sampling_info, True)
+        expanded_temperatures = torch.tensor(
+            [[1.0], [1.0], [1.0], [2.0], [2.0], [2.0]]
+        )
+        expected = torch.softmax(logits / expanded_temperatures, dim=-1)
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_tree_rejection_rejects_non_integral_branch_count(self):
+        logits = torch.zeros(5, 2)
+        sampling_info = SimpleNamespace(temperatures=torch.ones(2, 1))
+
+        with self.assertRaisesRegex(ValueError, "must be a multiple"):
+            renorm_draft_probs(logits, sampling_info, True)
 
     def test_eagle3_decode_extend_uses_topk_without_q(self):
         worker = self._worker_for_decode_extend(classic=False, eagle3=True, topk=3)
