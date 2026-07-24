@@ -94,6 +94,10 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Used by DFlash distribution losses (kl-only / ce-tv / kl-tv): the target's
+    # final post-norm hidden (lm_head input), full sequence. Populated only when
+    # LogitsProcessor.capture_dflash_final_hidden is toggled on for the capture forward.
+    dflash_final_hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -301,6 +305,12 @@ class LogitsProcessor(nn.Module):
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
 
+        # DFlash: when toggled on for a capture forward, forward() also returns the
+        # final post-norm hidden (lm_head input) as dflash_final_hidden_states, for
+        # the distribution losses. Off by default; the DFlash capture backend flips
+        # it around a single forward and resets it afterwards.
+        self.capture_dflash_final_hidden = False
+
     def forward(
         self,
         input_ids,
@@ -361,6 +371,9 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
+        # DFlash distribution losses need the full-sequence final post-norm hidden
+        # (the lm_head input). hidden_states here is exactly that; capture before del.
+        dflash_final_hidden = hidden_states if self.capture_dflash_final_hidden else None
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
@@ -374,6 +387,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                dflash_final_hidden_states=dflash_final_hidden,
                 # FIXME: These fields are not logits-related but are passed through here as a
                 # workaround since ForwardBatch is local to forward_batch_generation().
                 # They should be moved to GenerationBatchResult to keep this class clean.
@@ -415,6 +429,7 @@ class LogitsProcessor(nn.Module):
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            dflash_final_hidden_states=dflash_final_hidden,
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
