@@ -51,6 +51,7 @@ class TestEagleRejectionModes(CustomTestCase):
         worker.use_eagle3_rejection_sampling = eagle3
         worker.topk = topk
         worker.device = "cpu"
+        worker.speculative_draft_temperature = None
         worker.speculative_num_draft_tokens = 1
         worker.cuda_graph_runner_for_draft_extend = None
         worker.plan_stream = None
@@ -99,6 +100,22 @@ class TestEagleRejectionModes(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "must be a multiple"):
             renorm_draft_probs(logits, sampling_info, True)
+
+    def test_draft_temperature_zero_ignores_request_temperature(self):
+        logits = torch.tensor([[2.0, 0.0], [4.0, 0.0]])
+        sampling_info = SimpleNamespace(temperatures=torch.tensor([[10.0]]))
+
+        actual = renorm_draft_probs(logits, sampling_info, True, 0.0)
+
+        torch.testing.assert_close(actual, torch.softmax(logits, dim=-1))
+
+    def test_positive_draft_temperature_overrides_request_temperature(self):
+        logits = torch.tensor([[2.0, 0.0], [4.0, 0.0]])
+        sampling_info = SimpleNamespace(temperatures=torch.tensor([[10.0]]))
+
+        actual = renorm_draft_probs(logits, sampling_info, True, 2.0)
+
+        torch.testing.assert_close(actual, torch.softmax(logits / 2.0, dim=-1))
 
     def test_eagle3_decode_extend_uses_topk_without_q(self):
         worker = self._worker_for_decode_extend(classic=False, eagle3=True, topk=3)

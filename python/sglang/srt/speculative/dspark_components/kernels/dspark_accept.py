@@ -12,6 +12,7 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_dflash_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
+    tree_speculative_sampling_target_only,
 )
 from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
 from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
@@ -32,7 +33,7 @@ class AcceptSampling:
         *,
         candidates: torch.Tensor,
         target_logits: torch.Tensor,
-        draft_probs: torch.Tensor,
+        draft_probs: Optional[torch.Tensor],
         sampling_info,
         draft_input: DFlashDraftInputV2,
         gamma: int,
@@ -56,7 +57,7 @@ class AcceptSampling:
         *,
         candidates: torch.Tensor,
         target_logits: torch.Tensor,
-        draft_probs: torch.Tensor,
+        draft_probs: Optional[torch.Tensor],
         sampling_info,
         draft_input: DFlashDraftInputV2,
         gamma: int,
@@ -79,7 +80,7 @@ def _accept_sampling_core(
     *,
     candidates: torch.Tensor,
     target_logits: torch.Tensor,
-    draft_probs: torch.Tensor,
+    draft_probs: Optional[torch.Tensor],
     sampling_info,
     draft_input: DFlashDraftInputV2,
     gamma: int,
@@ -115,20 +116,35 @@ def _accept_sampling_core(
         draft_token_num=verify_num_draft_tokens,
         device=device,
     )
-    uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
+    uniform_samples = torch.rand((bs, verify_num_draft_tokens), dtype=torch.float32, device=device)
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
-    chain_speculative_sampling_triton(
+    sampling_fn = (
+        tree_speculative_sampling_target_only
+        if draft_probs is None
+        else chain_speculative_sampling_triton
+    )
+    if sampling_fn is None:
+        raise RuntimeError(
+            "Target-only speculative sampling requires the sgl-kernel sampling ops."
+        )
+    sampling_draft_probs = (
+        torch.zeros_like(target_probs) if draft_probs is None else draft_probs
+    )
+    candidates_i64 = (
+        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
+    )
+    sampling_fn(
         predicts=predicts,
         accept_index=accept_index,
         accept_token_num=accept_token_num,
-        candidates=candidates,
+        candidates=candidates_i64,
         retrive_index=retrieve_index,
         retrive_next_token=retrieve_next_token,
         retrive_next_sibling=retrieve_next_sibling,
         uniform_samples=uniform_samples,
         uniform_samples_for_final_sampling=uniform_samples_final,
         target_probs=target_probs,
-        draft_probs=draft_probs,
+        draft_probs=sampling_draft_probs,
         threshold_single=1.0,
         threshold_acc=1.0,
         deterministic=True,
@@ -147,7 +163,7 @@ def accept_sampling(
     *,
     candidates: torch.Tensor,
     target_logits: torch.Tensor,
-    draft_probs: torch.Tensor,
+    draft_probs: Optional[torch.Tensor],
     sampling_info,
     draft_input: DFlashDraftInputV2,
     gamma: int,
@@ -215,7 +231,7 @@ def accept_sampling_triton(
     *,
     candidates: torch.Tensor,
     target_logits: torch.Tensor,
-    draft_probs: torch.Tensor,
+    draft_probs: Optional[torch.Tensor],
     sampling_info,
     draft_input: DFlashDraftInputV2,
     gamma: int,

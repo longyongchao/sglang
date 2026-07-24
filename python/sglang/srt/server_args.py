@@ -1732,8 +1732,12 @@ class ServerArgs:
     ] = 1.0
     speculative_use_rejection_sampling: A[
         bool,
-        "Use rejection sampling for speculative decoding (requires topk=1).",
+        "Use rejection sampling for supported speculative decoding algorithms.",
     ] = False
+    speculative_draft_temperature: A[
+        Optional[float],
+        "Draft-side temperature override for speculative proposals. Omit to inherit the request temperature; set to 0 for deterministic greedy drafting.",
+    ] = None
     speculative_token_map: A[
         Optional[str],
         "The path of the draft model's small vocab table.",

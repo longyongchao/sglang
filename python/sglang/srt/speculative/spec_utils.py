@@ -95,14 +95,22 @@ def renorm_draft_probs(
     next_token_logits: torch.Tensor,
     sampling_info,
     use_rejection_sampling: bool,
+    draft_temperature: Optional[float] = None,
 ) -> torch.Tensor:
     """Draft-side next-token distribution.
 
-    Plain softmax, except under rejection sampling where logits are
-    temperature-scaled so the draft proposal q tracks the target sampling
-    temperature (higher acceptance; correctness holds for any q).
+    ``draft_temperature=None`` inherits the request temperature when rejection
+    sampling is enabled. A positive override uses that temperature. Zero means
+    deterministic drafting: token selection remains top-k/argmax, while
+    ``softmax(logits)`` supplies stable scores for ranking a multi-branch tree.
     """
-    if not use_rejection_sampling or not next_token_logits.size(0):
+    if not next_token_logits.size(0):
+        return torch.softmax(next_token_logits, dim=-1)
+    if draft_temperature is not None:
+        if draft_temperature == 0:
+            return torch.softmax(next_token_logits, dim=-1)
+        return torch.softmax(next_token_logits / draft_temperature, dim=-1)
+    if not use_rejection_sampling:
         return torch.softmax(next_token_logits, dim=-1)
 
     temperatures = sampling_info.temperatures

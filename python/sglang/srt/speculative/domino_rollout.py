@@ -1065,7 +1065,8 @@ class DFlashDominoRollout:
         bonus_tokens: torch.Tensor,
         target_model,
         lm_head,
-    ) -> torch.Tensor:
+        return_logits: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Sequential Domino rollout to produce `block_size - 1` draft tokens.
 
         Algorithm mirrors dflash benchmark.py:244-264 for both
@@ -1091,9 +1092,11 @@ class DFlashDominoRollout:
             bonus_tokens: [B] current verified token per request (int64).
             target_model: the SGLang target model (for embed_tokens).
             lm_head: vocab-parallel lm_head (used to compute dense base logits).
+            return_logits: if True, return per-step logits for rejection sampling.
 
         Returns:
-            [B, block_size - 1] int64 tensor of sampled draft tokens.
+            Tuple of ([B, block_size - 1] int64 draft tokens, logits or None).
+            logits shape: [B, block_size - 1, vocab] when return_logits=True and TP=1.
         """
         bs, total_slots, hidden_size = draft_hidden.shape
         if total_slots != self.block_size:
@@ -1141,7 +1144,7 @@ class DFlashDominoRollout:
 
         state = domino_helper.get_rollout_state()
         if tp_size != 1:
-            return self._domino_rollout_draft_block_tp_eager(
+            out = self._domino_rollout_draft_block_tp_eager(
                 z=z,
                 bonus_tokens=bonus_tokens,
                 target_model=target_model,
@@ -1151,6 +1154,8 @@ class DFlashDominoRollout:
                 num_org_padded=num_org_padded,
                 state=state,
             )
+            # TP>1: logits are sharded, cannot return full logits cheaply.
+            return out, None
 
         candidate_pool_size = self._resolve_domino_candidate_pool_size(
             num_org,
@@ -1194,6 +1199,39 @@ class DFlashDominoRollout:
 
         z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
 
+        if return_logits:
+            # Eager path: accumulate per-step logits for rejection sampling.
+            # Cannot use cuda graph since we need the actual logit values.
+            logits_buf = torch.empty(
+                bs, num_draft, num_org, dtype=base_logits.dtype, device=device
+            )
+            # Slot 0: pure base_logits (no GRU bias for the first draft token).
+            logits_buf[:, 0, :] = base_logits[:, 0, :]
+            out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
+            out[:, 0].copy_(slot_1)
+
+            fc2_w_shard, fc2_b_shard = self._slice_domino_fc2(
+                state=state, start=org_vocab_start, length=num_org
+            )
+            gru_h_cur = gru_h
+            for k in range(1, num_draft):
+                s_proj = torch.nn.functional.linear(gru_h_cur, state["w_s"])
+                mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
+                bias = torch.nn.functional.linear(mid, fc2_w_shard, fc2_b_shard)
+                logits_k = base_logits[:, k, :] + bias.to(base_logits.dtype)
+                logits_buf[:, k, :] = logits_k
+                tok = torch.argmax(logits_k, dim=-1).to(torch.long) + org_vocab_start
+                out[:, k].copy_(tok)
+                if k + 1 < num_draft:
+                    gi = self._domino_lookup_gru_input_proj_full(
+                        token_ids=tok,
+                        full_gru_input_table=gru_input_table,
+                    )
+                    gru_h_cur = self._domino_manual_gru_step_from_input_proj(
+                        gi=gi, gru_h=gru_h_cur, state=state
+                    )
+            return out, logits_buf
+
         graph_entry = self._get_or_capture_domino_loop_graph(
             bs=bs,
             num_draft=num_draft,
@@ -1216,7 +1254,7 @@ class DFlashDominoRollout:
         graph_entry["out_buf"][:, 0].copy_(slot_1)
         graph_entry["graph"].replay()
         out = graph_entry["out_buf"]
-        return out
+        return out, None
 
 
 class DominoDraftSampler:

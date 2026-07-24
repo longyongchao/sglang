@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -101,6 +102,18 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         trust_remote_code=server_args.trust_remote_code,
         kwargs=kwargs,
     )
+
+    draft_temperature_arg = getattr(
+        server_args, "speculative_draft_temperature", None
+    )
+    if draft_temperature_arg is not None:
+        draft_temperature = float(draft_temperature_arg)
+        if not math.isfinite(draft_temperature) or draft_temperature < 0:
+            raise ValueError(
+                "--speculative-draft-temperature must be finite and >= 0, got "
+                f"{server_args.speculative_draft_temperature}."
+            )
+        server_args.speculative_draft_temperature = draft_temperature
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).

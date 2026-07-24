@@ -69,6 +69,15 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
         finally:
             os.unlink(config_file)
+    def test_speculative_draft_temperature_cli_arg(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        parsed = parser.parse_args(
+            ["--model-path", "dummy", "--speculative-draft-temperature", "0"]
+        )
+
+        self.assertEqual(parsed.speculative_draft_temperature, 0.0)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

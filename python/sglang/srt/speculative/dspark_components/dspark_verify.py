@@ -671,6 +671,19 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
+    if draft_block.deterministic_draft:
+        # draft_temp=0 → argmax drafting → q(x) is one-hot → target-only
+        # verification is correct and optimal (same as DFlash/Domino).
+        return AcceptSampling.execute(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_probs=None,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
     draft_probs = SoftmaxTemp.execute(
         logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),

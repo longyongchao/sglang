@@ -197,6 +197,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+            draft_temperature=server_args.speculative_draft_temperature,
         )
         self._verify_epilogue = None
         if (

@@ -32,6 +32,7 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     corrected_logits: Optional[torch.Tensor]
     greedy_mask: torch.Tensor
     temperatures: torch.Tensor
+    deterministic_draft: bool = False
 
 
 class DraftForwardResult(msgspec.Struct, frozen=True):
@@ -203,13 +204,27 @@ def sample_draft_block(
     sampling_info,
     markov_head,
     device: torch.device,
+    draft_temperature: Optional[float] = None,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
-    greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
-    any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
+    deterministic_draft = draft_temperature == 0
+    greedy_mask = (
+        torch.ones(bs, dtype=torch.bool, device=device)
+        if deterministic_draft
+        else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
+    )
+    any_sampling = (
+        not deterministic_draft
+        and sampling_info is not None
+        and not sampling_info.is_all_greedy
+    )
     fast_sampling = envs.SGLANG_DSPARK_FAST_SAMPLING.get()
 
-    if sampling_info is None:
+    if draft_temperature is not None:
+        temperatures = torch.full(
+            (bs,), max(float(draft_temperature), 1e-5), dtype=torch.float32, device=device
+        )
+    elif sampling_info is None:
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
     else:
         temperatures = (
@@ -253,6 +268,7 @@ def sample_draft_block(
         corrected_logits=corrected_logits,
         greedy_mask=greedy_mask,
         temperatures=temperatures,
+        deterministic_draft=deterministic_draft,
     )
 
 
@@ -266,6 +282,7 @@ class DraftBlockProposer:
         mask_token_id: int,
         draft_block_spec_info,
         dp_moe_sync: bool = False,
+        draft_temperature: Optional[float] = None,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -274,6 +291,7 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._draft_temperature = draft_temperature
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -306,31 +324,48 @@ class DraftBlockProposer:
         draft_block_ids = fwd.draft_block_ids
 
         draft_sampler = self._draft_sampler
-        all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        deterministic_draft = self._draft_temperature == 0
+        requests_all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        all_greedy = deterministic_draft or requests_all_greedy
         folded_confidence = None
         confidence_tap = None
         folded = False
         if draft_sampler is not None and fwd.can_run_graph and all_greedy:
-            folded = True
-            if sampling_info is None:
-                temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-            else:
-                temperatures = (
-                    sampling_info.temperatures.view(-1)
-                    .to(torch.float32)
-                    .clamp_min(1e-5)
+            # Only fold (skip corrected_logits) when requests are also greedy,
+            # because rejection sampling needs draft_probs from corrected_logits.
+            if requests_all_greedy:
+                folded = True
+                if self._draft_temperature is not None:
+                    temperatures = torch.full(
+                        (bs,),
+                        max(float(self._draft_temperature), 1e-5),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                elif sampling_info is None:
+                    temperatures = torch.ones(bs, dtype=torch.float32, device=device)
+                else:
+                    temperatures = (
+                        sampling_info.temperatures.view(-1)
+                        .to(torch.float32)
+                        .clamp_min(1e-5)
+                    )
+                draft_block = DraftBlockResult(
+                    draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
+                    corrected_logits=None,
+                    greedy_mask=(
+                        torch.ones(bs, dtype=torch.bool, device=device)
+                        if deterministic_draft
+                        else resolve_greedy_mask(
+                            bs=bs, sampling_info=sampling_info, device=device
+                        )
+                    ),
+                    temperatures=temperatures,
+                    deterministic_draft=deterministic_draft,
                 )
-            draft_block = DraftBlockResult(
-                draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
-                corrected_logits=None,
-                greedy_mask=resolve_greedy_mask(
-                    bs=bs, sampling_info=sampling_info, device=device
-                ),
-                temperatures=temperatures,
-            )
-            if draft_sampler.confidence_out is not None:
-                folded_confidence = draft_sampler.confidence_out[:bs]
-        else:
+                if draft_sampler.confidence_out is not None:
+                    folded_confidence = draft_sampler.confidence_out[:bs]
+        if not folded:
             with self._base_logits_context():
                 base_logits, confidence_tap = self.draft_model.compute_base_logits(
                     fwd.raw_hidden
@@ -343,6 +378,7 @@ class DraftBlockProposer:
                 sampling_info=sampling_info,
                 markov_head=self.draft_model.markov_head,
                 device=device,
+                draft_temperature=self._draft_temperature,
             )
         return DraftProposal(
             draft_block_ids=draft_block_ids,

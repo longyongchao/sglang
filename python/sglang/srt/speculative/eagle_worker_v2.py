@@ -154,6 +154,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.speculative_draft_temperature = (
+            server_args.speculative_draft_temperature
+        )
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -685,6 +688,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output.next_token_logits,
                     forward_batch.sampling_info,
                     True,
+                    self.speculative_draft_temperature,
                 )
                 topk_p, topk_index = fast_sample(probs, num_samples=1)
                 draft_probs_list.append(probs)
@@ -693,6 +697,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output.next_token_logits,
                     forward_batch.sampling_info,
                     True,
+                    self.speculative_draft_temperature,
                 )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             elif self.topk == 1 and not _is_hip:
@@ -705,6 +710,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output.next_token_logits,
                     forward_batch.sampling_info,
                     self.server_args.speculative_use_rejection_sampling,
+                    self.speculative_draft_temperature,
                 )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
@@ -828,6 +834,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             logits_output.next_token_logits,
             batch.sampling_info,
             self.server_args.speculative_use_rejection_sampling,
+            self.speculative_draft_temperature,
         )
         if self.use_classic_rejection_sampling:
             topk_p, topk_index = fast_sample(probs, num_samples=1)
@@ -937,6 +944,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits,
                 batch.sampling_info,
                 True,
+                self.speculative_draft_temperature,
             )
             ret_topk_p, ret_topk_index = fast_sample(probs, num_samples=1)
             ret_draft_probs = probs
@@ -945,6 +953,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits,
                 batch.sampling_info,
                 True,
+                self.speculative_draft_temperature,
             )
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
@@ -961,6 +970,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits,
                 batch.sampling_info,
                 self.server_args.speculative_use_rejection_sampling,
+                self.speculative_draft_temperature,
             )
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None

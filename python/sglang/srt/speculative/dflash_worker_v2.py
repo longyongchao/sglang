@@ -994,6 +994,53 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    def _greedy_sample_with_logits(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        need_logits: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Greedy argmax with optional logit retention for rejection sampling.
+
+        For TP=1 with no added vocab: computes full logits, returns (tokens, logits).
+        For TP>1 or added vocab: falls back to the existing greedy path with no logits.
+        """
+        if not need_logits or hidden_states.numel() == 0:
+            tokens = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=hidden_states, lm_head=lm_head
+            )
+            return tokens, None
+
+        weight = lm_head.weight
+        tp_size = int(get_tp_group().world_size)
+
+        if not hasattr(lm_head, "shard_indices") or tp_size > 1:
+            # TP>1: logits are sharded, cannot return full logits cheaply.
+            tokens = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=hidden_states, lm_head=lm_head
+            )
+            return tokens, None
+
+        shard = lm_head.shard_indices
+        num_org = int(shard.num_org_elements)
+        num_added = int(shard.num_added_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+
+        if num_added != 0:
+            # Added vocab complicates logit layout; fall back.
+            tokens = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=hidden_states, lm_head=lm_head
+            )
+            return tokens, None
+
+        # TP=1, no added vocab: compute full base logits.
+        weight_dtype = weight.dtype
+        hs = hidden_states if hidden_states.dtype == weight_dtype else hidden_states.to(weight_dtype)
+        logits = torch.matmul(hs, weight[:num_org].T)  # [num_tokens, num_org]
+        tokens = torch.argmax(logits, dim=-1).to(torch.long) + org_vocab_start
+        return tokens, logits
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1616,13 +1663,33 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
+        # Determine if we need draft logits for rejection sampling (non-greedy).
+        # Only needed when draft_temperature > 0 (stochastic drafting); when
+        # draft_temperature == 0 (argmax), q(x) = one-hot and target-only
+        # verification is already optimal (equivalent to RS with q=1).
+        draft_temp = self.server_args.speculative_draft_temperature
+        need_draft_logits = (
+            batch.sampling_info is not None
+            and not batch.sampling_info.is_all_greedy
+            and is_dflash_sampling_verify_available()
+            and draft_temp is not None
+            and draft_temp > 0
+        )
+        draft_logits = None  # [bs, block_size-1, vocab] when non-greedy TP=1
+
         if (
             self._domino_sampler is not None
             and draft_out.can_run_graph
             and bs <= self._domino_sampler.max_bs
+            and not need_draft_logits
         ):
             draft_next = self._domino_sampler.out[:bs]
-        elif self._domino_rollout is None and self._draft_sampler is not None and draft_out.can_run_graph:
+        elif (
+            self._domino_rollout is None
+            and self._draft_sampler is not None
+            and draft_out.can_run_graph
+            and not need_draft_logits
+        ):
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
@@ -1632,19 +1699,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
             if self._domino_rollout is not None:
-                draft_next = self._domino_rollout.rollout_draft_block(
+                draft_next, draft_logits = self._domino_rollout.rollout_draft_block(
                     draft_hidden=draft_hidden,
                     bonus_tokens=block_ids[:, 0],
                     target_model=target_model,
                     lm_head=lm_head,
+                    return_logits=need_draft_logits,
                 )
             else:
-                draft_next = self._greedy_sample_from_vocab_parallel_head(
+                draft_next, draft_logits = self._greedy_sample_with_logits(
                     hidden_states=draft_hidden[:, 1:, :].reshape(
                         -1, draft_hidden.shape[-1]
                     ),
                     lm_head=lm_head,
-                ).view(bs, int(self.block_size) - 1)
+                    need_logits=need_draft_logits,
+                )
+                if draft_logits is not None:
+                    draft_logits = draft_logits.view(bs, int(self.block_size) - 1, -1)
+                draft_next = draft_next.view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
@@ -1715,6 +1787,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+                draft_logits=draft_logits,
             )
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(

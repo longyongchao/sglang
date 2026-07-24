@@ -1,11 +1,19 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
 
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
     _target_checkpoint_bundles_dspark_draft,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockResult,
+    sample_draft_block,
+)
+from sglang.srt.speculative.dspark_components.dspark_verify import accept_draft_tokens
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -82,6 +90,66 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             server_args.speculative_draft_model_path,
             "deepseek-ai/some-other-dspark-draft",
         )
+
+
+class TestDsparkDraftTemperature(CustomTestCase):
+    def test_zero_temperature_forces_deterministic_argmax(self):
+        logits = torch.tensor([[[1.0, 3.0, 2.0], [4.0, 0.0, 1.0]]])
+
+        class MarkovHead:
+            def sample_block(self, base_logits, **kwargs):
+                sampler = kwargs["sampler"]
+                tokens = torch.stack(
+                    [sampler(base_logits[:, step], step) for step in range(2)], dim=1
+                )
+                return tokens, base_logits
+
+        sampling_info = SimpleNamespace(
+            is_all_greedy=False,
+            temperatures=torch.tensor([[1.0]]),
+            top_ks=torch.tensor([[50]]),
+        )
+        result = sample_draft_block(
+            base_logits=logits,
+            anchor_tokens=torch.zeros(1, dtype=torch.long),
+            draft_hidden=torch.zeros(1, 2, 1),
+            sampling_info=sampling_info,
+            markov_head=MarkovHead(),
+            device=torch.device("cpu"),
+            draft_temperature=0.0,
+        )
+
+        self.assertTrue(result.deterministic_draft)
+        self.assertTrue(bool(result.greedy_mask.all()))
+        torch.testing.assert_close(result.draft_tokens, torch.tensor([[1, 0]]))
+
+    def test_deterministic_draft_uses_target_only_verifier(self):
+        draft_block = DraftBlockResult(
+            draft_tokens=torch.tensor([[1, 2]]),
+            corrected_logits=None,
+            greedy_mask=torch.ones(1, dtype=torch.bool),
+            temperatures=torch.ones(1),
+            deterministic_draft=True,
+        )
+        sampling_info = SimpleNamespace(is_all_greedy=False)
+        expected = (torch.tensor([2]), torch.tensor([3]), torch.tensor([0]))
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify.AcceptSampling.execute",
+            return_value=expected,
+        ) as accept_sampling:
+            actual = accept_draft_tokens(
+                candidates=torch.tensor([[1, 2, 3]]),
+                target_logits=torch.zeros(3, 4),
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                draft_input=SimpleNamespace(),
+                gamma=2,
+                verify_num_draft_tokens=3,
+            )
+
+        self.assertEqual(actual, expected)
+        self.assertIsNone(accept_sampling.call_args.kwargs["draft_probs"])
 
 
 if __name__ == "__main__":
