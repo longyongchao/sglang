@@ -331,9 +331,12 @@ class DraftBlockProposer:
         confidence_tap = None
         folded = False
         if draft_sampler is not None and fwd.can_run_graph and all_greedy:
-            # Only fold (skip corrected_logits) when requests are also greedy,
-            # because rejection sampling needs draft_probs from corrected_logits.
-            if requests_all_greedy:
+            # Fold (skip corrected_logits) when either:
+            # 1. All requests are greedy (no rejection sampling needed), OR
+            # 2. Draft is deterministic (draft_temp=0): verification uses
+            #    target-only path (deterministic_draft=True → draft_probs=None),
+            #    so corrected_logits are not needed regardless of target temp.
+            if requests_all_greedy or deterministic_draft:
                 folded = True
                 if self._draft_temperature is not None:
                     temperatures = torch.full(
