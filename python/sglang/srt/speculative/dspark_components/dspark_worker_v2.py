@@ -637,6 +637,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 on_publish(accept.new_seq_lens)
 
         folded_commit = folded_accept and epilogue.folds_commit
+        if self._observers.profiling_active:
+            folded_commit = False
         if not folded_commit:
             with self._observers.segment(InfoSegment.DRAFT_KV_MATERIALIZE):
                 self._verify_executor.commit_hidden(

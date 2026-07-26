@@ -230,6 +230,19 @@ class DsparkInfoDumper:
         if InfoComponent.STEP_GPU_TIME in self._components:
             self._open_segment(InfoSegment.STEP)
 
+    @property
+    def profiling_active(self) -> bool:
+        """True when sub-segment profiling is enabled (requires eager paths)."""
+        return self.enabled and bool(
+            self._components
+            & {
+                InfoComponent.DRAFT_BACKBONE_GPU_TIME,
+                InfoComponent.DRAFT_BASE_LOGITS_GPU_TIME,
+                InfoComponent.DRAFT_MARKOV_SAMPLE_GPU_TIME,
+                InfoComponent.DRAFT_KV_MATERIALIZE_GPU_TIME,
+            }
+        )
+
     def segment(self, name: Union[InfoSegment, str]) -> ContextManager[None]:
         if not self.enabled:
             return _NULL_SEGMENT
@@ -326,6 +339,8 @@ class DsparkInfoDumper:
             return InfoComponent.DRAFT_MARKOV_SAMPLE_GPU_TIME in self._components
         if segment is InfoSegment.TARGET_VERIFY:
             return InfoComponent.TARGET_VERIFY_GPU_TIME in self._components
+        if segment is InfoSegment.DRAFT_KV_MATERIALIZE:
+            return InfoComponent.DRAFT_KV_MATERIALIZE_GPU_TIME in self._components
         return False
 
     def _open_segment(self, segment: InfoSegment) -> None:
@@ -820,6 +835,10 @@ class DsparkStepObservers:
 
     def segment(self, name: Union[InfoSegment, str]) -> ContextManager[None]:
         return self._info_dumper.segment(name)
+
+    @property
+    def profiling_active(self) -> bool:
+        return self._info_dumper.profiling_active
 
     def note_prefill_step(self) -> None:
         self._info_dumper.note_non_decode_step()
