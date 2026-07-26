@@ -41,6 +41,7 @@ class InfoComponent(str, Enum):
     DRAFT_BASE_LOGITS_GPU_TIME = "draft_base_logits_gpu_time"
     DRAFT_MARKOV_SAMPLE_GPU_TIME = "draft_markov_sample_gpu_time"
     TARGET_VERIFY_GPU_TIME = "target_verify_gpu_time"
+    DRAFT_KV_MATERIALIZE_GPU_TIME = "draft_kv_materialize_gpu_time"
     REQS = "reqs"
 
 
@@ -51,6 +52,7 @@ class InfoSegment(str, Enum):
     DRAFT_BASE_LOGITS = "draft_base_logits"
     DRAFT_MARKOV_SAMPLE = "draft_markov_sample"
     TARGET_VERIFY = "target_verify"
+    DRAFT_KV_MATERIALIZE = "draft_kv_materialize"
 
 
 INFO_DUMP_MAX_RECORDS = 200_000
@@ -125,6 +127,7 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     draft_base_logits_gpu_ms: Optional[float] = None
     draft_markov_sample_gpu_ms: Optional[float] = None
     target_verify_gpu_ms: Optional[float] = None
+    draft_kv_materialize_gpu_ms: Optional[float] = None
     reqs: Optional[list[ReqDetail]] = None
 
 
@@ -394,6 +397,10 @@ class DsparkInfoDumper:
         if InfoComponent.TARGET_VERIFY_GPU_TIME in self._components:
             record.target_verify_gpu_ms = self._segment_ms(
                 pending, InfoSegment.TARGET_VERIFY
+            )
+        if InfoComponent.DRAFT_KV_MATERIALIZE_GPU_TIME in self._components:
+            record.draft_kv_materialize_gpu_ms = self._segment_ms(
+                pending, InfoSegment.DRAFT_KV_MATERIALIZE
             )
         if InfoComponent.REQS in self._components and pending.future is not None:
             record.reqs = self._build_reqs(
