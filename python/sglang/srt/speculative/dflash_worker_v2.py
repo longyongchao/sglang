@@ -217,6 +217,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         # anchor_prediction: all block_size positions produce a next-token prediction.
         # standard: position 0 is the seeded bonus; positions 1..block_size-1 produce drafts.
         self._num_draft_tokens = self.block_size if self._anchor_prediction else self.block_size - 1
+        # org_vocab_start for the lm_head shard — needed to align draft logits
+        # with the full-vocab target probs during rejection sampling.
+        self._draft_vocab_start = 0
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -1014,11 +1017,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         hidden_states: torch.Tensor,
         lm_head,
         need_logits: bool = False,
+        draft_temperature: float = 0.0,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Greedy argmax with optional logit retention for rejection sampling.
+        """Sample draft tokens with optional logit retention for rejection sampling.
 
-        For TP=1 with no added vocab: computes full logits, returns (tokens, logits).
-        For TP>1 or added vocab: falls back to the existing greedy path with no logits.
+        When need_logits=True and draft_temperature>0, tokens are sampled from
+        softmax(logits/temperature) so the proposal distribution q matches what
+        is passed to the verification kernel. When draft_temperature==0 or
+        need_logits=False, falls back to greedy argmax.
         """
         if not need_logits or hidden_states.numel() == 0:
             tokens = self._greedy_sample_from_vocab_parallel_head(
@@ -1052,7 +1058,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         weight_dtype = weight.dtype
         hs = hidden_states if hidden_states.dtype == weight_dtype else hidden_states.to(weight_dtype)
         logits = torch.matmul(hs, weight[:num_org].T)  # [num_tokens, num_org]
-        tokens = torch.argmax(logits, dim=-1).to(torch.long) + org_vocab_start
+        if draft_temperature > 0:
+            # Sample from the draft distribution to match rejection sampling q.
+            probs = torch.softmax(logits.float() / draft_temperature, dim=-1)
+            local_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        else:
+            local_ids = torch.argmax(logits, dim=-1)
+        tokens = local_ids.to(torch.long) + org_vocab_start
         return tokens, logits
 
     def _append_target_hidden_to_draft_kv_by_loc(
@@ -1527,6 +1539,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DFLASH requires the target model to expose `lm_head` with `weight`."
             )
+        # Cache org_vocab_start for draft logits → full vocab alignment.
+        if self._draft_vocab_start == 0 and hasattr(lm_head, "shard_indices"):
+            self._draft_vocab_start = int(lm_head.shard_indices.org_vocab_start_index)
 
         block_size = int(self.block_size)
         self._ensure_draft_block_buffers(bs)
@@ -1719,6 +1734,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_model=target_model,
                     lm_head=lm_head,
                     return_logits=need_draft_logits,
+                    draft_temperature=draft_temp if draft_temp is not None else 0.0,
                 )
             else:
                 if self._anchor_prediction:
@@ -1732,6 +1748,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     hidden_states=hs_for_head,
                     lm_head=lm_head,
                     need_logits=need_draft_logits,
+                    draft_temperature=draft_temp if draft_temp is not None else 0.0,
                 )
                 if draft_logits is not None:
                     draft_logits = draft_logits.view(bs, self._num_draft_tokens, -1)
@@ -1814,6 +1831,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
                 draft_logits=draft_logits,
+                draft_vocab_start=self._draft_vocab_start,
+                draft_temperature=draft_temp if draft_temp is not None else 1.0,
             )
             commit_lens = accept_len.to(torch.int32) + 1  # [bs]
             out_tokens = torch.empty(

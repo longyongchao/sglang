@@ -684,6 +684,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
     draft_logits: Optional[torch.Tensor] = None,
+    draft_vocab_start: int = 0,
+    draft_temperature: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
@@ -777,17 +779,21 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
         # draft_logits: [bs, block_size-1, draft_vocab] — per-draft-step logits
-        draft_probs_partial = torch.softmax(draft_logits.float(), dim=-1)
+        # Apply draft_temperature to match the actual sampling distribution q.
+        scaled_draft_logits = draft_logits.float()
+        if draft_temperature > 0 and draft_temperature != 1.0:
+            scaled_draft_logits = scaled_draft_logits / draft_temperature
+        draft_probs_partial = torch.softmax(scaled_draft_logits, dim=-1)
         draft_vocab = draft_probs_partial.shape[-1]
         # Build full draft_probs: [bs, draft_token_num, vocab]
         # Row 0 = zeros (bonus/verified position, not verified via RS)
         draft_probs = torch.zeros(
             bs, draft_token_num, vocab, dtype=torch.float32, device=device
         )
-        if draft_vocab < vocab:
-            draft_probs[:, 1:, :draft_vocab] = draft_probs_partial
-        else:
-            draft_probs[:, 1:, :vocab] = draft_probs_partial[:, :, :vocab]
+        # Place draft probs at the correct global vocab offset.
+        end_idx = min(draft_vocab_start + draft_vocab, vocab)
+        src_len = end_idx - draft_vocab_start
+        draft_probs[:, 1:, draft_vocab_start:end_idx] = draft_probs_partial[:, :, :src_len]
         sampling_fn = chain_speculative_sampling_triton
     else:
         draft_probs = torch.zeros_like(target_probs)

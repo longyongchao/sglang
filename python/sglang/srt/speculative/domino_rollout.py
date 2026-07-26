@@ -1066,6 +1066,7 @@ class DFlashDominoRollout:
         target_model,
         lm_head,
         return_logits: bool = False,
+        draft_temperature: float = 0.0,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Sequential Domino rollout to produce `block_size - 1` draft tokens.
 
@@ -1189,14 +1190,6 @@ class DFlashDominoRollout:
         slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
         slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
 
-        gru_h = self._init_domino_prefix_gru_hidden(
-            prefix_ids=torch.stack([bonus_tokens.to(torch.long), slot_1], dim=1),
-            z_dtype=z.dtype,
-            device=device,
-            state=state,
-            full_gru_input_table=gru_input_table,
-        )
-
         z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
 
         if return_logits:
@@ -1208,7 +1201,21 @@ class DFlashDominoRollout:
             # Slot 0: pure base_logits (no GRU bias for the first draft token).
             logits_buf[:, 0, :] = base_logits[:, 0, :]
             out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
+            # Sample slot_1 according to draft_temperature for consistency with RS.
+            if draft_temperature > 0:
+                probs_0 = torch.softmax(base_logits[:, 0, :].float() / draft_temperature, dim=-1)
+                local_id_0 = torch.multinomial(probs_0, num_samples=1).squeeze(-1)
+                slot_1 = local_id_0.to(torch.long) + org_vocab_start
             out[:, 0].copy_(slot_1)
+
+            # Initialize GRU with the (possibly re-sampled) slot_1.
+            gru_h = self._init_domino_prefix_gru_hidden(
+                prefix_ids=torch.stack([bonus_tokens.to(torch.long), slot_1], dim=1),
+                z_dtype=z.dtype,
+                device=device,
+                state=state,
+                full_gru_input_table=gru_input_table,
+            )
 
             fc2_w_shard, fc2_b_shard = self._slice_domino_fc2(
                 state=state, start=org_vocab_start, length=num_org
@@ -1220,7 +1227,12 @@ class DFlashDominoRollout:
                 bias = torch.nn.functional.linear(mid, fc2_w_shard, fc2_b_shard)
                 logits_k = base_logits[:, k, :] + bias.to(base_logits.dtype)
                 logits_buf[:, k, :] = logits_k
-                tok = torch.argmax(logits_k, dim=-1).to(torch.long) + org_vocab_start
+                if draft_temperature > 0:
+                    probs_k = torch.softmax(logits_k.float() / draft_temperature, dim=-1)
+                    local_id_k = torch.multinomial(probs_k, num_samples=1).squeeze(-1)
+                    tok = local_id_k.to(torch.long) + org_vocab_start
+                else:
+                    tok = torch.argmax(logits_k, dim=-1).to(torch.long) + org_vocab_start
                 out[:, k].copy_(tok)
                 if k + 1 < num_draft:
                     gi = self._domino_lookup_gru_input_proj_full(
@@ -1231,6 +1243,14 @@ class DFlashDominoRollout:
                         gi=gi, gru_h=gru_h_cur, state=state
                     )
             return out, logits_buf
+
+        gru_h = self._init_domino_prefix_gru_hidden(
+            prefix_ids=torch.stack([bonus_tokens.to(torch.long), slot_1], dim=1),
+            z_dtype=z.dtype,
+            device=device,
+            state=state,
+            full_gru_input_table=gru_input_table,
+        )
 
         graph_entry = self._get_or_capture_domino_loop_graph(
             bs=bs,
