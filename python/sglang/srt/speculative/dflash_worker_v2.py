@@ -1707,6 +1707,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
+        self._observers.open_segment("draft")
+
         with torch.inference_mode():
             with self._observers.segment("draft_backbone"):
                 draft_out = self.draft_model_runner.forward(forward_batch)
@@ -1779,6 +1781,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                         draft_logits = draft_logits.view(bs, self._num_draft_tokens, -1)
                     draft_next = draft_next.view(bs, self._num_draft_tokens)
 
+        self._observers.close_segment("draft")
+
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         if self._anchor_prediction:
@@ -1826,6 +1830,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
+        self._observers.open_segment("target_verify")
         with self._observers.segment("target_forward"):
             target_out = self.target_worker.forward_batch_generation(
                 batch=None,
@@ -1939,6 +1944,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 commit_lens=commit_lens,
             )
+
+        self._observers.close_segment("target_verify")
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)

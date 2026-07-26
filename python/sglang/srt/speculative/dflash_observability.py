@@ -198,6 +198,23 @@ class DFlashInfoDumper:
             return _NULL_SEGMENT
         return self._active_segment(seg)
 
+    def open_segment(self, name: Union[DFlashInfoSegment, str]) -> None:
+        """Manually open a segment (pair with close_segment for non-nested spans)."""
+        if not self.enabled:
+            return
+        seg = DFlashInfoSegment(name)
+        comp = _SEGMENT_TO_COMPONENT.get(seg)
+        if comp is None or comp not in self._components:
+            return
+        self._open_segment(seg)
+
+    def close_segment(self, name: Union[DFlashInfoSegment, str]) -> None:
+        """Manually close a previously opened segment."""
+        if not self.enabled:
+            return
+        seg = DFlashInfoSegment(name)
+        self._close_segment(seg)
+
     @contextmanager
     def _active_segment(self, segment: DFlashInfoSegment) -> Iterator[None]:
         self._open_segment(segment)
@@ -328,6 +345,12 @@ class DFlashStepObservers:
 
     def segment(self, name: Union[DFlashInfoSegment, str]) -> ContextManager[None]:
         return self._info_dumper.segment(name)
+
+    def open_segment(self, name: Union[DFlashInfoSegment, str]) -> None:
+        self._info_dumper.open_segment(name)
+
+    def close_segment(self, name: Union[DFlashInfoSegment, str]) -> None:
+        self._info_dumper.close_segment(name)
 
     def observe_decode_step(self, forward_ct: int, bs: int) -> None:
         self._info_dumper.observe_decode_step(forward_ct, bs)
