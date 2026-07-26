@@ -785,15 +785,18 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             scaled_draft_logits = scaled_draft_logits / draft_temperature
         draft_probs_partial = torch.softmax(scaled_draft_logits, dim=-1)
         draft_vocab = draft_probs_partial.shape[-1]
+        num_draft = draft_probs_partial.shape[1]  # block_size - 1
         # Build full draft_probs: [bs, draft_token_num, vocab]
-        # Row 0 = zeros (bonus/verified position, not verified via RS)
+        # The kernel at step=k (k=1..block_size-1) reads draft_probs[cur_prob_row=k-1].
+        # So draft_probs[0..num_draft-1] must hold q for slot_1..slot_{num_draft}.
         draft_probs = torch.zeros(
             bs, draft_token_num, vocab, dtype=torch.float32, device=device
         )
-        # Place draft probs at the correct global vocab offset.
+        # Place draft probs at the correct positions (rows 0..num_draft-1)
+        # and correct global vocab offset.
         end_idx = min(draft_vocab_start + draft_vocab, vocab)
         src_len = end_idx - draft_vocab_start
-        draft_probs[:, 1:, draft_vocab_start:end_idx] = draft_probs_partial[:, :, :src_len]
+        draft_probs[:, :num_draft, draft_vocab_start:end_idx] = draft_probs_partial[:, :, :src_len]
         sampling_fn = chain_speculative_sampling_triton
     else:
         draft_probs = torch.zeros_like(target_probs)
