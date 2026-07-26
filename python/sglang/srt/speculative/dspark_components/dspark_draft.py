@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import Optional
+from typing import Callable, ContextManager, Optional
 
 import msgspec
 import torch
@@ -292,9 +292,15 @@ class DraftBlockProposer:
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
         self._draft_temperature = draft_temperature
+        self._segment_fn: Optional[Callable[[str], ContextManager[None]]] = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
+
+    def attach_segment_fn(
+        self, segment_fn: Callable[[str], ContextManager[None]]
+    ) -> None:
+        self._segment_fn = segment_fn
 
     def _base_logits_context(self):
         if self._dp_moe_sync:
@@ -313,14 +319,16 @@ class DraftBlockProposer:
         sampling_info,
     ) -> DraftProposal:
         embed_module = target_model.get_input_embeddings()
-        fwd = self._run_forward(
-            batch=batch,
-            draft_input=draft_input,
-            verify_window=verify_window,
-            bs=bs,
-            device=device,
-            embed_module=embed_module,
-        )
+        _seg = self._segment_fn
+        with _seg("draft_forward") if _seg else nullcontext():
+            fwd = self._run_forward(
+                batch=batch,
+                draft_input=draft_input,
+                verify_window=verify_window,
+                bs=bs,
+                device=device,
+                embed_module=embed_module,
+            )
         draft_block_ids = fwd.draft_block_ids
 
         draft_sampler = self._draft_sampler
@@ -330,7 +338,9 @@ class DraftBlockProposer:
         folded_confidence = None
         confidence_tap = None
         folded = False
-        if draft_sampler is not None and fwd.can_run_graph and all_greedy:
+        # When segment_fn is attached (profiling active), skip fold to get
+        # separate timing for base_logits and markov_sample sub-segments.
+        if draft_sampler is not None and fwd.can_run_graph and all_greedy and not _seg:
             # Fold (skip corrected_logits) when either:
             # 1. All requests are greedy (no rejection sampling needed), OR
             # 2. Draft is deterministic (draft_temp=0): verification uses
@@ -369,20 +379,23 @@ class DraftBlockProposer:
                 if draft_sampler.confidence_out is not None:
                     folded_confidence = draft_sampler.confidence_out[:bs]
         if not folded:
-            with self._base_logits_context():
+            with self._base_logits_context(), (
+                _seg("draft_base_logits") if _seg else nullcontext()
+            ):
                 base_logits, confidence_tap = self.draft_model.compute_base_logits(
                     fwd.raw_hidden
                 )
                 base_logits = base_logits.view(bs, self.gamma, -1)
-            draft_block = sample_draft_block(
-                base_logits=base_logits,
-                anchor_tokens=draft_block_ids[:, 0],
-                draft_hidden=fwd.draft_hidden_3d,
-                sampling_info=sampling_info,
-                markov_head=self.draft_model.markov_head,
-                device=device,
-                draft_temperature=self._draft_temperature,
-            )
+            with _seg("draft_markov_sample") if _seg else nullcontext():
+                draft_block = sample_draft_block(
+                    base_logits=base_logits,
+                    anchor_tokens=draft_block_ids[:, 0],
+                    draft_hidden=fwd.draft_hidden_3d,
+                    sampling_info=sampling_info,
+                    markov_head=self.draft_model.markov_head,
+                    device=device,
+                    draft_temperature=self._draft_temperature,
+                )
         return DraftProposal(
             draft_block_ids=draft_block_ids,
             draft_block=draft_block,

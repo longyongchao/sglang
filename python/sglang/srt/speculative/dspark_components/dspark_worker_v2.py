@@ -261,6 +261,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
+        self._proposer.attach_segment_fn(self._observers.segment)
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
