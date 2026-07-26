@@ -44,6 +44,7 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -280,6 +281,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
 
+        from sglang.srt.speculative.dflash_observability import (
+            DFlashStepObservers,
+        )
+
+        self._observers = DFlashStepObservers(
+            device=self.device,
+            block_size=self.block_size,
+            attn_tp_rank=get_parallel().attn_tp_rank,
+        )
+
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
@@ -299,6 +310,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
         )
+
+    def dump_info_records(self):
+        return self._observers.dump_info_records()
+
+    def clear_info_records(self):
+        self._observers.clear_info_records()
 
     def alloc_memory_pool(
         self,
@@ -1531,6 +1548,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
         device = self.device
 
+        self._observers.begin_step()
+
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
@@ -1689,7 +1708,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         with torch.inference_mode():
-            draft_out = self.draft_model_runner.forward(forward_batch)
+            with self._observers.segment("draft_backbone"):
+                draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
         # Determine if we need draft logits for rejection sampling (non-greedy).
@@ -1706,11 +1726,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         draft_logits = None  # [bs, block_size-1, vocab] when non-greedy TP=1
 
+        _profiling = self._observers.profiling_active
         if (
             self._domino_sampler is not None
             and draft_out.can_run_graph
             and bs <= self._domino_sampler.max_bs
             and not need_draft_logits
+            and not _profiling
         ):
             draft_next = self._domino_sampler.out[:bs]
         elif (
@@ -1718,41 +1740,44 @@ class DFlashWorkerV2(BaseSpecWorker):
             and self._draft_sampler is not None
             and draft_out.can_run_graph
             and not need_draft_logits
+            and not _profiling
         ):
             draft_next = self._draft_sampler.out[
                 : bs * self._num_draft_tokens
             ].view(bs, self._num_draft_tokens)
         else:
-            draft_hidden = draft_logits_output.hidden_states
-            if draft_hidden is None:
-                raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            if self._domino_rollout is not None:
-                draft_next, draft_logits = self._domino_rollout.rollout_draft_block(
-                    draft_hidden=draft_hidden,
-                    bonus_tokens=block_ids[:, 0],
-                    target_model=target_model,
-                    lm_head=lm_head,
-                    return_logits=need_draft_logits,
-                    draft_temperature=draft_temp if draft_temp is not None else 0.0,
-                )
-            else:
-                if self._anchor_prediction:
-                    # All block_size positions produce predictions
-                    hs_for_head = draft_hidden.reshape(-1, draft_hidden.shape[-1])
-                else:
-                    hs_for_head = draft_hidden[:, 1:, :].reshape(
-                        -1, draft_hidden.shape[-1]
+            with self._observers.segment("draft_sampling"):
+                draft_hidden = draft_logits_output.hidden_states
+                if draft_hidden is None:
+                    raise RuntimeError("DFLASH draft model returned no hidden states.")
+                draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+                if self._domino_rollout is not None:
+                    draft_next, draft_logits = self._domino_rollout.rollout_draft_block(
+                        draft_hidden=draft_hidden,
+                        bonus_tokens=block_ids[:, 0],
+                        target_model=target_model,
+                        lm_head=lm_head,
+                        return_logits=need_draft_logits,
+                        draft_temperature=draft_temp if draft_temp is not None else 0.0,
+                        segment_fn=self._observers.segment,
                     )
-                draft_next, draft_logits = self._greedy_sample_with_logits(
-                    hidden_states=hs_for_head,
-                    lm_head=lm_head,
-                    need_logits=need_draft_logits,
-                    draft_temperature=draft_temp if draft_temp is not None else 0.0,
-                )
-                if draft_logits is not None:
-                    draft_logits = draft_logits.view(bs, self._num_draft_tokens, -1)
-                draft_next = draft_next.view(bs, self._num_draft_tokens)
+                else:
+                    if self._anchor_prediction:
+                        # All block_size positions produce predictions
+                        hs_for_head = draft_hidden.reshape(-1, draft_hidden.shape[-1])
+                    else:
+                        hs_for_head = draft_hidden[:, 1:, :].reshape(
+                            -1, draft_hidden.shape[-1]
+                        )
+                    draft_next, draft_logits = self._greedy_sample_with_logits(
+                        hidden_states=hs_for_head,
+                        lm_head=lm_head,
+                        need_logits=need_draft_logits,
+                        draft_temperature=draft_temp if draft_temp is not None else 0.0,
+                    )
+                    if draft_logits is not None:
+                        draft_logits = draft_logits.view(bs, self._num_draft_tokens, -1)
+                    draft_next = draft_next.view(bs, self._num_draft_tokens)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
@@ -1801,12 +1826,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
+        with self._observers.segment("target_forward"):
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True,
+            )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
@@ -1819,80 +1845,21 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
-        if (
-            sampling_info is not None
-            and not sampling_info.is_all_greedy
-            and is_dflash_sampling_verify_available()
-        ):
-            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
-                candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
-                sampling_info=sampling_info,
-                max_top_k=draft_input.max_top_k,
-                uniform_top_k_value=draft_input.uniform_top_k_value,
-                draft_logits=draft_logits,
-                draft_vocab_start=self._draft_vocab_start,
-                draft_temperature=draft_temp if draft_temp is not None else 1.0,
-            )
-            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-            out_tokens = torch.empty(
-                (bs, int(self.block_size)), dtype=torch.int64, device=device
-            )
-            if int(self.block_size) > 1:
-                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
-            out_tokens[:, int(self.block_size) - 1].fill_(0)
-            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
-        else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
-            if self._use_triton_accept_bonus:
-                try:
-                    (
-                        accept_len,
-                        commit_lens,
-                        bonus,
-                        out_tokens,
-                        new_seq_lens,
-                    ) = self._next_accept_bonus_buffers(bs)
-                    _compute_dflash_accept_bonus_triton_unchecked(
-                        candidates=candidates,
-                        target_top1=target_predict,
-                        accept_lens_out=accept_len,
-                        commit_lens_out=commit_lens,
-                        bonus_ids_out=bonus,
-                        out_tokens_out=out_tokens,
-                        prefix_lens=prefix_lens,
-                        new_seq_lens_out=new_seq_lens,
-                    )
-                except Exception as e:
-                    self._use_triton_accept_bonus = False
-                    logger.warning(
-                        "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
-                        e,
-                    )
-                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
-                        candidates=candidates,
-                        target_predict=target_predict,
-                    )
-                    commit_lens = accept_len.to(torch.int32) + 1  # [bs]
-                    out_tokens = torch.empty(
-                        (bs, int(self.block_size)),
-                        dtype=torch.int64,
-                        device=device,
-                    )
-                    if int(self.block_size) > 1:
-                        out_tokens[:, : int(self.block_size) - 1].copy_(
-                            candidates[:, 1:]
-                        )
-                    out_tokens[:, int(self.block_size) - 1].fill_(0)
-                    out_tokens.scatter_(
-                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
-                    )
-            else:
-                accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+        with self._observers.segment("accept_bonus"):
+            if (
+                sampling_info is not None
+                and not sampling_info.is_all_greedy
+                and is_dflash_sampling_verify_available()
+            ):
+                accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                     candidates=candidates,
-                    target_predict=target_predict,
+                    next_token_logits=logits_output.next_token_logits,
+                    sampling_info=sampling_info,
+                    max_top_k=draft_input.max_top_k,
+                    uniform_top_k_value=draft_input.uniform_top_k_value,
+                    draft_logits=draft_logits,
+                    draft_vocab_start=self._draft_vocab_start,
+                    draft_temperature=draft_temp if draft_temp is not None else 1.0,
                 )
                 commit_lens = accept_len.to(torch.int32) + 1  # [bs]
                 out_tokens = torch.empty(
@@ -1901,7 +1868,67 @@ class DFlashWorkerV2(BaseSpecWorker):
                 if int(self.block_size) > 1:
                     out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
                 out_tokens[:, int(self.block_size) - 1].fill_(0)
-                out_tokens.scatter_(
+                out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+            else:
+                target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+                    bs, int(self.block_size)
+                )
+                if self._use_triton_accept_bonus:
+                    try:
+                        (
+                            accept_len,
+                            commit_lens,
+                            bonus,
+                            out_tokens,
+                            new_seq_lens,
+                        ) = self._next_accept_bonus_buffers(bs)
+                        _compute_dflash_accept_bonus_triton_unchecked(
+                            candidates=candidates,
+                            target_top1=target_predict,
+                            accept_lens_out=accept_len,
+                            commit_lens_out=commit_lens,
+                            bonus_ids_out=bonus,
+                            out_tokens_out=out_tokens,
+                            prefix_lens=prefix_lens,
+                            new_seq_lens_out=new_seq_lens,
+                        )
+                    except Exception as e:
+                        self._use_triton_accept_bonus = False
+                        logger.warning(
+                            "DFLASH Triton accept/bonus failed; falling back to eager path: %s",
+                            e,
+                        )
+                        accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                            candidates=candidates,
+                            target_predict=target_predict,
+                        )
+                        commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+                        out_tokens = torch.empty(
+                            (bs, int(self.block_size)),
+                            dtype=torch.int64,
+                            device=device,
+                        )
+                        if int(self.block_size) > 1:
+                            out_tokens[:, : int(self.block_size) - 1].copy_(
+                                candidates[:, 1:]
+                            )
+                        out_tokens[:, int(self.block_size) - 1].fill_(0)
+                        out_tokens.scatter_(
+                            1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                        )
+                else:
+                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                    )
+                    commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+                    out_tokens = torch.empty(
+                        (bs, int(self.block_size)), dtype=torch.int64, device=device
+                    )
+                    if int(self.block_size) > 1:
+                        out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
+                    out_tokens[:, int(self.block_size) - 1].fill_(0)
+                    out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
@@ -1926,16 +1953,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
-            positions=positions,
-            commit_lens=commit_lens,
-        )
+        with self._observers.segment("draft_kv_materialize"):
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                cache_loc=verify_out_cache_loc,
+                cache_loc_2d=verify_out_cache_loc_2d,
+                positions=positions,
+                commit_lens=commit_lens,
+            )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
+
+        self._observers.observe_decode_step(batch.forward_ct, bs)
 
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus,

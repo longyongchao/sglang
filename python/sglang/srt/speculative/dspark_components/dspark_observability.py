@@ -58,10 +58,12 @@ INFO_DUMP_MAX_STEP_CPU_SECONDS = 1.0
 
 
 def resolve_enabled_components() -> set[InfoComponent]:
-    """Components enabled via env: SGLANG_DSPARK_DEBUG_DUMP tokens, plus the
-    published SPS-profiling switch SGLANG_DSPARK_ENABLE_SPS_RECORD=1, which is
-    an alias for the core,step_cpu_time components the SPS table fit needs."""
-    components = resolve_components(envs.SGLANG_DSPARK_DEBUG_DUMP.get())
+    """Components enabled via env: SGLANG_SPEC_DEBUG_DUMP (unified) or
+    SGLANG_DSPARK_DEBUG_DUMP (legacy fallback) tokens, plus the published
+    SPS-profiling switch SGLANG_DSPARK_ENABLE_SPS_RECORD=1, which is an alias
+    for the core,step_cpu_time components the SPS table fit needs."""
+    raw = envs.SGLANG_SPEC_DEBUG_DUMP.get() or envs.SGLANG_DSPARK_DEBUG_DUMP.get()
+    components = resolve_components(raw)
     if envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get():
         components |= {InfoComponent.CORE, InfoComponent.STEP_CPU_TIME}
     if InfoComponent.DRAFT_GPU_TIME in components:

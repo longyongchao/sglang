@@ -1,6 +1,7 @@
 import logging
 import os
-from typing import Optional
+from contextlib import nullcontext
+from typing import Callable, ContextManager, Optional
 
 import torch
 
@@ -56,6 +57,7 @@ class DFlashDominoRollout:
         num_org: int,
         num_org_padded: int,
         state: dict,
+        segment_fn: Optional[Callable[[str], ContextManager]] = None,
     ) -> torch.Tensor:
         """Domino rollout for TP>1.
 
@@ -67,6 +69,7 @@ class DFlashDominoRollout:
 
         bs, num_draft, hidden_size = z.shape
         device = z.device
+        _seg = segment_fn if segment_fn is not None else lambda _: nullcontext()
         weight = lm_head.weight
         weight_dtype = weight.dtype
         embed_module = target_model.get_input_embeddings()
@@ -105,20 +108,23 @@ class DFlashDominoRollout:
         z_for_dtype = z.to(weight_dtype) if z.dtype != weight_dtype else z
         score_weight = full_lm_head_weight if use_replicated_scorer else weight[:num_org]
         score_vocab_size = valid_vocab_size if use_replicated_scorer else num_org
-        base_logits = torch.matmul(
-            z_for_dtype.reshape(bs * num_draft, hidden_size),
-            score_weight.T,
-        ).view(bs, num_draft, score_vocab_size)
+        with _seg("draft_base_logits"):
+            base_logits = torch.matmul(
+                z_for_dtype.reshape(bs * num_draft, hidden_size),
+                score_weight.T,
+            ).view(bs, num_draft, score_vocab_size)
 
-        out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
-        if use_replicated_scorer:
-            slot_1 = torch.argmax(base_logits[:, 0, :], dim=-1).to(torch.long)
-        else:
-            slot_1 = self.global_argmax_from_local_logits(
-                local_logits=base_logits[:, 0, :],
-                local_vocab_start=org_vocab_start,
-            )
-        out[:, 0].copy_(slot_1)
+            out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
+            if use_replicated_scorer:
+                slot_1 = torch.argmax(base_logits[:, 0, :], dim=-1).to(torch.long)
+            else:
+                slot_1 = self.global_argmax_from_local_logits(
+                    local_logits=base_logits[:, 0, :],
+                    local_vocab_start=org_vocab_start,
+                )
+            out[:, 0].copy_(slot_1)
+
+            z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
 
         gru_h = self._init_domino_prefix_gru_hidden(
             prefix_ids=torch.stack([bonus_tokens.to(torch.long), slot_1], dim=1),
@@ -131,7 +137,6 @@ class DFlashDominoRollout:
             num_org=num_org,
         )
 
-        z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
         if use_replicated_scorer:
             fc2_w, fc2_b = self._slice_domino_fc2(
                 state=state,
@@ -200,165 +205,166 @@ class DFlashDominoRollout:
         w_s_hh_T = state.get("w_s_hh_T", None)
         use_fused_gru = z.is_cuda and full_gru_input_table is not None
         gru_h_next = torch.empty_like(gru_h) if use_fused_gru else None
-        for k in range(1, num_draft):
-            gh = None
-            if w_s_hh_T is not None and k + 1 < num_draft:
-                sh = torch.matmul(gru_h, w_s_hh_T)
-                s_proj = sh[:, :emb_dim]
-                gh = sh[:, emb_dim : emb_dim + 3 * G]
-            else:
-                s_proj = torch.nn.functional.linear(gru_h, state["w_s"], None)
-            if use_fused_score:
-                if candidate_ids is None:
+        with _seg("draft_gru_correct"):
+            for k in range(1, num_draft):
+                gh = None
+                if w_s_hh_T is not None and k + 1 < num_draft:
+                    sh = torch.matmul(gru_h, w_s_hh_T)
+                    s_proj = sh[:, :emb_dim]
+                    gh = sh[:, emb_dim : emb_dim + 3 * G]
+                else:
+                    s_proj = torch.nn.functional.linear(gru_h, state["w_s"], None)
+                if use_fused_score:
+                    if candidate_ids is None:
+                        if use_replicated_scorer:
+                            fused_silu_fc2_argmax(
+                                z_proj=z_proj_all[:, k, :],
+                                s_proj=s_proj,
+                                fc2_weight=fc2_w,
+                                fc2_bias=fc2_b,
+                                base_logits=base_logits[:, k, :],
+                                out_val=score_val_buf,
+                                out_idx=score_idx_buf,
+                                final_token=local_tok_buf,
+                                block_v=block_v,
+                                block_m=block_m,
+                                num_warps=score_num_warps,
+                                num_stages=score_num_stages,
+                            )
+                        else:
+                            assert local_val_buf is not None
+                            fused_silu_fc2_argmax_with_value(
+                                z_proj=z_proj_all[:, k, :],
+                                s_proj=s_proj,
+                                fc2_weight=fc2_w,
+                                fc2_bias=fc2_b,
+                                base_logits=base_logits[:, k, :],
+                                out_val=score_val_buf,
+                                out_idx=score_idx_buf,
+                                final_token=local_tok_buf,
+                                final_value=local_val_buf,
+                                block_v=block_v,
+                                block_m=block_m,
+                                num_warps=score_num_warps,
+                                num_stages=score_num_stages,
+                            )
+                    else:
+                        if use_replicated_scorer:
+                            fused_silu_fc2_candidate_argmax(
+                                z_proj=z_proj_all[:, k, :],
+                                s_proj=s_proj,
+                                fc2_weight=fc2_w,
+                                fc2_bias=fc2_b,
+                                base_logits=base_logits[:, k, :],
+                                candidate_ids=candidate_ids,
+                                out_val=score_val_buf,
+                                out_idx=score_idx_buf,
+                                final_token=local_tok_buf,
+                                block_c=candidate_block_c,
+                                block_m=block_m,
+                                num_warps=score_num_warps,
+                                num_stages=score_num_stages,
+                            )
+                        else:
+                            assert local_val_buf is not None
+                            fused_silu_fc2_candidate_argmax_with_value(
+                                z_proj=z_proj_all[:, k, :],
+                                s_proj=s_proj,
+                                fc2_weight=fc2_w,
+                                fc2_bias=fc2_b,
+                                base_logits=base_logits[:, k, :],
+                                candidate_ids=candidate_ids,
+                                out_val=score_val_buf,
+                                out_idx=score_idx_buf,
+                                final_token=local_tok_buf,
+                                final_value=local_val_buf,
+                                block_c=candidate_block_c,
+                                block_m=block_m,
+                                num_warps=score_num_warps,
+                                num_stages=score_num_stages,
+                            )
                     if use_replicated_scorer:
-                        fused_silu_fc2_argmax(
-                            z_proj=z_proj_all[:, k, :],
-                            s_proj=s_proj,
-                            fc2_weight=fc2_w,
-                            fc2_bias=fc2_b,
-                            base_logits=base_logits[:, k, :],
-                            out_val=score_val_buf,
-                            out_idx=score_idx_buf,
-                            final_token=local_tok_buf,
-                            block_v=block_v,
-                            block_m=block_m,
-                            num_warps=score_num_warps,
-                            num_stages=score_num_stages,
-                        )
+                        tok = local_tok_buf.to(torch.long)
                     else:
-                        assert local_val_buf is not None
-                        fused_silu_fc2_argmax_with_value(
-                            z_proj=z_proj_all[:, k, :],
-                            s_proj=s_proj,
-                            fc2_weight=fc2_w,
-                            fc2_bias=fc2_b,
-                            base_logits=base_logits[:, k, :],
-                            out_val=score_val_buf,
-                            out_idx=score_idx_buf,
-                            final_token=local_tok_buf,
-                            final_value=local_val_buf,
-                            block_v=block_v,
-                            block_m=block_m,
-                            num_warps=score_num_warps,
-                            num_stages=score_num_stages,
+                        tok = self.global_argmax_from_local_max(
+                            local_max=local_val_buf,
+                            global_ids=local_tok_buf.to(torch.int64) + int(org_vocab_start),
                         )
-                else:
+                elif candidate_ids is None:
+                    mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
+                    bias_local = torch.nn.functional.linear(mid, fc2_w, fc2_b)
+                    logits_k = base_logits[:, k, :] + bias_local.to(base_logits.dtype)
                     if use_replicated_scorer:
-                        fused_silu_fc2_candidate_argmax(
-                            z_proj=z_proj_all[:, k, :],
-                            s_proj=s_proj,
-                            fc2_weight=fc2_w,
-                            fc2_bias=fc2_b,
-                            base_logits=base_logits[:, k, :],
-                            candidate_ids=candidate_ids,
-                            out_val=score_val_buf,
-                            out_idx=score_idx_buf,
-                            final_token=local_tok_buf,
-                            block_c=candidate_block_c,
-                            block_m=block_m,
-                            num_warps=score_num_warps,
-                            num_stages=score_num_stages,
-                        )
+                        tok = torch.argmax(logits_k, dim=-1).to(torch.long)
                     else:
-                        assert local_val_buf is not None
-                        fused_silu_fc2_candidate_argmax_with_value(
-                            z_proj=z_proj_all[:, k, :],
-                            s_proj=s_proj,
-                            fc2_weight=fc2_w,
-                            fc2_bias=fc2_b,
-                            base_logits=base_logits[:, k, :],
-                            candidate_ids=candidate_ids,
-                            out_val=score_val_buf,
-                            out_idx=score_idx_buf,
-                            final_token=local_tok_buf,
-                            final_value=local_val_buf,
-                            block_c=candidate_block_c,
-                            block_m=block_m,
-                            num_warps=score_num_warps,
-                            num_stages=score_num_stages,
+                        tok = self.global_argmax_from_local_logits(
+                            local_logits=logits_k,
+                            local_vocab_start=org_vocab_start,
                         )
-                if use_replicated_scorer:
-                    tok = local_tok_buf.to(torch.long)
                 else:
-                    tok = self.global_argmax_from_local_max(
-                        local_max=local_val_buf,
-                        global_ids=local_tok_buf.to(torch.int64) + int(org_vocab_start),
+                    assert candidate_fc2_w is not None
+                    assert candidate_token_ids is not None
+                    mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
+                    bias_local = torch.bmm(
+                        candidate_fc2_w, mid.unsqueeze(-1)
+                    ).squeeze(-1)
+                    if candidate_fc2_b is not None:
+                        bias_local = bias_local + candidate_fc2_b
+                    logits_k = (
+                        torch.gather(base_logits[:, k, :], 1, candidate_ids)
+                        + bias_local.to(base_logits.dtype)
                     )
-            elif candidate_ids is None:
-                mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
-                bias_local = torch.nn.functional.linear(mid, fc2_w, fc2_b)
-                logits_k = base_logits[:, k, :] + bias_local.to(base_logits.dtype)
-                if use_replicated_scorer:
-                    tok = torch.argmax(logits_k, dim=-1).to(torch.long)
-                else:
-                    tok = self.global_argmax_from_local_logits(
-                        local_logits=logits_k,
-                        local_vocab_start=org_vocab_start,
-                    )
-            else:
-                assert candidate_fc2_w is not None
-                assert candidate_token_ids is not None
-                mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
-                bias_local = torch.bmm(
-                    candidate_fc2_w, mid.unsqueeze(-1)
-                ).squeeze(-1)
-                if candidate_fc2_b is not None:
-                    bias_local = bias_local + candidate_fc2_b
-                logits_k = (
-                    torch.gather(base_logits[:, k, :], 1, candidate_ids)
-                    + bias_local.to(base_logits.dtype)
-                )
-                if use_replicated_scorer:
-                    local_arg = torch.argmax(logits_k, dim=-1)
-                    tok = torch.gather(
-                        candidate_token_ids, 1, local_arg.unsqueeze(1)
-                    ).view(-1)
-                else:
-                    tok = self.global_argmax_from_local_logits(
-                        local_logits=logits_k,
-                        local_vocab_start=org_vocab_start,
-                        local_token_ids=candidate_token_ids,
-                    )
-            out[:, k].copy_(tok)
-            if k + 1 < num_draft:
-                if use_fused_gru and gh is not None:
-                    assert gru_h_next is not None
-                    assert full_gru_input_table is not None
-                    fused_gru_cell_from_table(
-                        tok_full=tok,
-                        gru_input_table=full_gru_input_table,
-                        gh=gh,
-                        gh_bias=state["b_hh"],
-                        h_state=gru_h,
-                        h_out=gru_h_next,
-                    )
-                    gru_h, gru_h_next = gru_h_next, gru_h
-                else:
-                    if full_gru_input_table is not None:
-                        gi = self._domino_lookup_gru_input_proj_full(
-                            token_ids=tok,
-                            full_gru_input_table=full_gru_input_table,
-                        )
+                    if use_replicated_scorer:
+                        local_arg = torch.argmax(logits_k, dim=-1)
+                        tok = torch.gather(
+                            candidate_token_ids, 1, local_arg.unsqueeze(1)
+                        ).view(-1)
                     else:
-                        gi = self._domino_lookup_gru_input_proj_tp(
-                            token_ids=tok,
-                            local_gru_input_table=gru_input_table,
-                            org_vocab_start=org_vocab_start,
-                            num_org=num_org,
+                        tok = self.global_argmax_from_local_logits(
+                            local_logits=logits_k,
+                            local_vocab_start=org_vocab_start,
+                            local_token_ids=candidate_token_ids,
                         )
-                    if gh is None:
-                        gru_h = self._domino_manual_gru_step_from_input_proj(
-                            gi=gi,
-                            gru_h=gru_h,
-                            state=state,
-                        )
-                    else:
-                        gru_h = self._domino_manual_gru_step_from_projections(
-                            gi=gi,
+                out[:, k].copy_(tok)
+                if k + 1 < num_draft:
+                    if use_fused_gru and gh is not None:
+                        assert gru_h_next is not None
+                        assert full_gru_input_table is not None
+                        fused_gru_cell_from_table(
+                            tok_full=tok,
+                            gru_input_table=full_gru_input_table,
                             gh=gh,
-                            gru_h=gru_h,
-                            state=state,
+                            gh_bias=state["b_hh"],
+                            h_state=gru_h,
+                            h_out=gru_h_next,
                         )
+                        gru_h, gru_h_next = gru_h_next, gru_h
+                    else:
+                        if full_gru_input_table is not None:
+                            gi = self._domino_lookup_gru_input_proj_full(
+                                token_ids=tok,
+                                full_gru_input_table=full_gru_input_table,
+                            )
+                        else:
+                            gi = self._domino_lookup_gru_input_proj_tp(
+                                token_ids=tok,
+                                local_gru_input_table=gru_input_table,
+                                org_vocab_start=org_vocab_start,
+                                num_org=num_org,
+                            )
+                        if gh is None:
+                            gru_h = self._domino_manual_gru_step_from_input_proj(
+                                gi=gi,
+                                gru_h=gru_h,
+                                state=state,
+                            )
+                        else:
+                            gru_h = self._domino_manual_gru_step_from_projections(
+                                gi=gi,
+                                gh=gh,
+                                gru_h=gru_h,
+                                state=state,
+                            )
 
         return out
 
@@ -1067,6 +1073,7 @@ class DFlashDominoRollout:
         lm_head,
         return_logits: bool = False,
         draft_temperature: float = 0.0,
+        segment_fn: Optional[Callable[[str], ContextManager]] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Sequential Domino rollout to produce `block_size - 1` draft tokens.
 
@@ -1144,6 +1151,7 @@ class DFlashDominoRollout:
             z = draft_hidden[:, 1:, :].contiguous()  # [B, num_draft, hidden]
 
         state = domino_helper.get_rollout_state()
+        _seg = segment_fn if segment_fn is not None else lambda _: nullcontext()
         if tp_size != 1:
             out = self._domino_rollout_draft_block_tp_eager(
                 z=z,
@@ -1154,6 +1162,7 @@ class DFlashDominoRollout:
                 num_org=num_org,
                 num_org_padded=num_org_padded,
                 state=state,
+                segment_fn=_seg,
             )
             # TP>1: logits are sharded, cannot return full logits cheaply.
             return out, None
@@ -1171,26 +1180,27 @@ class DFlashDominoRollout:
         )
 
         # Original eager-prologue path.
-        z_flat = z_for_dtype.reshape(bs * num_draft, hidden_size)
-        base_logits = torch.matmul(z_flat, weight[:num_org].T).view(
-            bs, num_draft, num_org
-        )
-
-        candidate_ids = None
-        if candidate_pool_size > 0:
-            pool_source = (
-                base_logits[:, 1:, :]
-                if int(base_logits.shape[1]) > 1 else base_logits[:, :1, :]
+        with _seg("draft_base_logits"):
+            z_flat = z_for_dtype.reshape(bs * num_draft, hidden_size)
+            base_logits = torch.matmul(z_flat, weight[:num_org].T).view(
+                bs, num_draft, num_org
             )
-            pool_logits = pool_source.max(dim=1).values
-            candidate_ids = torch.topk(
-                pool_logits, k=candidate_pool_size, dim=-1
-            ).indices.contiguous()
 
-        slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
-        slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
+            candidate_ids = None
+            if candidate_pool_size > 0:
+                pool_source = (
+                    base_logits[:, 1:, :]
+                    if int(base_logits.shape[1]) > 1 else base_logits[:, :1, :]
+                )
+                pool_logits = pool_source.max(dim=1).values
+                candidate_ids = torch.topk(
+                    pool_logits, k=candidate_pool_size, dim=-1
+                ).indices.contiguous()
 
-        z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
+            slot_local_arg = torch.argmax(base_logits[:, 0, :], dim=-1)
+            slot_1 = (slot_local_arg + org_vocab_start).to(torch.long)
+
+            z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
 
         if return_logits:
             # Eager path: accumulate per-step logits for rejection sampling.
@@ -1220,60 +1230,62 @@ class DFlashDominoRollout:
             fc2_w_shard, fc2_b_shard = self._slice_domino_fc2(
                 state=state, start=org_vocab_start, length=num_org
             )
-            gru_h_cur = gru_h
-            for k in range(1, num_draft):
-                s_proj = torch.nn.functional.linear(gru_h_cur, state["w_s"])
-                mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
-                bias = torch.nn.functional.linear(mid, fc2_w_shard, fc2_b_shard)
-                logits_k = base_logits[:, k, :] + bias.to(base_logits.dtype)
-                logits_buf[:, k, :] = logits_k
-                if draft_temperature > 0:
-                    probs_k = torch.softmax(logits_k.float() / draft_temperature, dim=-1)
-                    local_id_k = torch.multinomial(probs_k, num_samples=1).squeeze(-1)
-                    tok = local_id_k.to(torch.long) + org_vocab_start
-                else:
-                    tok = torch.argmax(logits_k, dim=-1).to(torch.long) + org_vocab_start
-                out[:, k].copy_(tok)
-                if k + 1 < num_draft:
-                    gi = self._domino_lookup_gru_input_proj_full(
-                        token_ids=tok,
-                        full_gru_input_table=gru_input_table,
-                    )
-                    gru_h_cur = self._domino_manual_gru_step_from_input_proj(
-                        gi=gi, gru_h=gru_h_cur, state=state
-                    )
+            with _seg("draft_gru_correct"):
+                gru_h_cur = gru_h
+                for k in range(1, num_draft):
+                    s_proj = torch.nn.functional.linear(gru_h_cur, state["w_s"])
+                    mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
+                    bias = torch.nn.functional.linear(mid, fc2_w_shard, fc2_b_shard)
+                    logits_k = base_logits[:, k, :] + bias.to(base_logits.dtype)
+                    logits_buf[:, k, :] = logits_k
+                    if draft_temperature > 0:
+                        probs_k = torch.softmax(logits_k.float() / draft_temperature, dim=-1)
+                        local_id_k = torch.multinomial(probs_k, num_samples=1).squeeze(-1)
+                        tok = local_id_k.to(torch.long) + org_vocab_start
+                    else:
+                        tok = torch.argmax(logits_k, dim=-1).to(torch.long) + org_vocab_start
+                    out[:, k].copy_(tok)
+                    if k + 1 < num_draft:
+                        gi = self._domino_lookup_gru_input_proj_full(
+                            token_ids=tok,
+                            full_gru_input_table=gru_input_table,
+                        )
+                        gru_h_cur = self._domino_manual_gru_step_from_input_proj(
+                            gi=gi, gru_h=gru_h_cur, state=state
+                        )
             return out, logits_buf
 
-        gru_h = self._init_domino_prefix_gru_hidden(
-            prefix_ids=torch.stack([bonus_tokens.to(torch.long), slot_1], dim=1),
-            z_dtype=z.dtype,
-            device=device,
-            state=state,
-            full_gru_input_table=gru_input_table,
-        )
+        with _seg("draft_gru_correct"):
+            gru_h = self._init_domino_prefix_gru_hidden(
+                prefix_ids=torch.stack([bonus_tokens.to(torch.long), slot_1], dim=1),
+                z_dtype=z.dtype,
+                device=device,
+                state=state,
+                full_gru_input_table=gru_input_table,
+            )
 
-        graph_entry = self._get_or_capture_domino_loop_graph(
-            bs=bs,
-            num_draft=num_draft,
-            emb_dim=emb_dim,
-            gru_hidden=G,
-            num_org=num_org,
-            org_vocab_start=org_vocab_start,
-            z_dtype=z.dtype,
-            logits_dtype=base_logits.dtype,
-            device=device,
-            state=state,
-            gru_input_table=gru_input_table,
-            candidate_pool_size=candidate_pool_size,
-        )
-        graph_entry["z_proj_buf"].copy_(z_proj_all)
-        graph_entry["base_logits_buf"].copy_(base_logits)
-        if candidate_ids is not None:
-            graph_entry["candidate_ids_buf"].copy_(candidate_ids)
-        graph_entry["gru_h_buf"].copy_(gru_h)
-        graph_entry["out_buf"][:, 0].copy_(slot_1)
-        graph_entry["graph"].replay()
-        out = graph_entry["out_buf"]
+            graph_entry = self._get_or_capture_domino_loop_graph(
+                bs=bs,
+                num_draft=num_draft,
+                emb_dim=emb_dim,
+                gru_hidden=G,
+                num_org=num_org,
+                org_vocab_start=org_vocab_start,
+                z_dtype=z.dtype,
+                logits_dtype=base_logits.dtype,
+                device=device,
+                state=state,
+                gru_input_table=gru_input_table,
+                candidate_pool_size=candidate_pool_size,
+            )
+            graph_entry["z_proj_buf"].copy_(z_proj_all)
+            graph_entry["base_logits_buf"].copy_(base_logits)
+            if candidate_ids is not None:
+                graph_entry["candidate_ids_buf"].copy_(candidate_ids)
+            graph_entry["gru_h_buf"].copy_(gru_h)
+            graph_entry["out_buf"][:, 0].copy_(slot_1)
+            graph_entry["graph"].replay()
+            out = graph_entry["out_buf"]
         return out, None
 
 

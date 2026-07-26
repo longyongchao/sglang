@@ -105,6 +105,7 @@ from sglang.srt.utils.common import (
     log_info_on_rank0,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.runtime_context import get_parallel
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
@@ -501,15 +502,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = self.prepare_for_draft(
-            draft_input,
-            self.req_to_token_pool,
-            batch,
-            self.cuda_graph_runner,
-            self.draft_runner,
-            self.topk,
-            self.speculative_num_steps,
-        )
+        with self._observers.segment("draft_prepare"):
+            forward_batch, can_cuda_graph = self.prepare_for_draft(
+                draft_input,
+                self.req_to_token_pool,
+                batch,
+                self.cuda_graph_runner,
+                self.draft_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -523,7 +525,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         with canary_outside_ctx:
             # Run draft
-            if can_cuda_graph:
+            _profiling = self._observers.profiling_active
+            if can_cuda_graph and not _profiling:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
@@ -549,44 +552,45 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Build tree mask
         # Directly write to cuda graph buffers for verify attn
-        tree_mask_buf, position_buf = (
-            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-        )
+        with self._observers.segment("draft_tree_build"):
+            tree_mask_buf, position_buf = (
+                self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+            )
 
-        # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
-        # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
-        seq_lens_sum = batch.seq_lens_sum
-        if seq_lens_sum is None:
-            if tree_mask_buf is None:
-                max_context_len = (
-                    self.target_worker.model_runner.attn_backend.max_context_len
-                )
-                seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
-            else:
-                # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
-                seq_lens_sum = 0
+            # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
+            # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
+            seq_lens_sum = batch.seq_lens_sum
+            if seq_lens_sum is None:
+                if tree_mask_buf is None:
+                    max_context_len = (
+                        self.target_worker.model_runner.attn_backend.max_context_len
+                    )
+                    seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
+                else:
+                    # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
+                    seq_lens_sum = 0
 
-        (
-            tree_mask,
-            position,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            draft_input.bonus_tokens,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            batch.seq_lens,
-            seq_lens_sum,
-            self.topk,
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
-            self.tree_mask_mode,
-            tree_mask_buf,
-            position_buf,
-        )
+            (
+                tree_mask,
+                position,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                draft_input.bonus_tokens,
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                batch.seq_lens,
+                seq_lens_sum,
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.tree_mask_mode,
+                tree_mask_buf,
+                position_buf,
+            )
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
@@ -640,38 +644,39 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.index_share_for_mtp_iteration:
             forward_batch.reuse_mtp_topk_indices = True
             forward_batch.topk_indices = None
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
+        with self._observers.segment("draft_forward_steps"):
+            for i in range(self.speculative_num_steps):
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
 
-            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
-                break
+                # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
+                if i == self.speculative_num_steps - 1:
+                    break
 
-            # Set inputs
-            forward_batch.input_ids = input_ids
-            # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
-            # argument must be contiguous.
-            if (
-                self.draft_runner.model_config.hf_config.architectures[0]
-                == "Qwen3MoeForCausalLMMTP"
-            ):
-                out_cache_loc = out_cache_loc.contiguous()
-            forward_batch.out_cache_loc = out_cache_loc[i]
-            spec_info.hidden_states = hidden_states
+                # Set inputs
+                forward_batch.input_ids = input_ids
+                # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
+                # argument must be contiguous.
+                if (
+                    self.draft_runner.model_config.hf_config.architectures[0]
+                    == "Qwen3MoeForCausalLMMTP"
+                ):
+                    out_cache_loc = out_cache_loc.contiguous()
+                forward_batch.out_cache_loc = out_cache_loc[i]
+                spec_info.hidden_states = hidden_states
 
-            # Run forward under a per-step ForwardContext so the model layer
-            # reads attn_backends[i] for the i-th draft step, plus a canary
-            # index context so canary tracks which draft step is active.
-            canary_index_ctx = (
-                c.with_active_single_forward_manager(i)
-                if (c := self.draft_runner.canary_manager) is not None
-                else contextlib.nullcontext()
-            )
+                # Run forward under a per-step ForwardContext so the model layer
+                # reads attn_backends[i] for the i-th draft step, plus a canary
+                # index context so canary tracks which draft step is active.
+                canary_index_ctx = (
+                    c.with_active_single_forward_manager(i)
+                    if (c := self.draft_runner.canary_manager) is not None
+                    else contextlib.nullcontext()
+                )
             with (
                 forward_context(
                     ForwardContext(
@@ -680,7 +685,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ),
                 canary_index_ctx,
             ):
+                self._observers.open_per_step_segment()
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
+                self._observers.close_per_step_segment()
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             if self.use_classic_rejection_sampling:
@@ -1048,6 +1055,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+        from sglang.srt.speculative.eagle_observability import (
+            EagleStepObservers,
+        )
+
+        self._observers = EagleStepObservers(
+            device=self.device,
+            num_steps=self.speculative_num_steps,
+            attn_tp_rank=get_parallel().attn_tp_rank,
+        )
+        self._draft_worker._observers = self._observers
+
     @property
     def war_fastpath_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
@@ -1064,6 +1082,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self._draft_worker.draft_extend_attn_backend
             or self._draft_worker.draft_runner.attn_backend,
         )
+
+    def dump_info_records(self):
+        return self._observers.dump_info_records()
+
+    def clear_info_records(self):
+        self._observers.clear_info_records()
 
     def alloc_memory_pool(
         self,
@@ -1162,6 +1186,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
+            self._observers.begin_step()
+
             if batch.spec_info is None:
                 capture_mode = (
                     CaptureHiddenMode.NULL
@@ -1188,11 +1214,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
+                    self._observers.segment("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch)
+            with self._observers.segment("target_verify"):
+                batch_output = self.verify(batch)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1209,8 +1237,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
+                    self._observers.segment("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+            self._observers.observe_decode_step(batch.forward_ct, batch.seq_lens.shape[0])
 
             return batch_output
 
@@ -1578,11 +1609,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-        (
-            predict,
-            accept_lens,
-            accept_index,
-        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        with self._observers.segment("verify_sample"):
+            (
+                predict,
+                accept_lens,
+                accept_index,
+            ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification

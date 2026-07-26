@@ -3828,6 +3828,16 @@ class Scheduler(
             if info_record is not None:
                 ret["dspark_info_record"] = info_record
 
+        if self.spec_algorithm.is_dflash() and self.draft_worker is not None:
+            info_record = self.draft_worker.dump_info_records()
+            if info_record is not None:
+                ret["dflash_info_record"] = info_record
+
+        if self.spec_algorithm.is_eagle() and self.draft_worker is not None:
+            info_record = self.draft_worker.dump_info_records()
+            if info_record is not None:
+                ret["eagle_info_record"] = info_record
+
         # This field is not serializable.
         ret.pop("model_config", None)
 
@@ -3842,6 +3852,8 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "dflash_clear_info_records",
+                "eagle_clear_info_records",
             ]
         )
 
@@ -3880,6 +3892,24 @@ class Scheduler(
                 ):
                     logging.warning(
                         "dspark_clear_info_records requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
+            elif k == "dflash_clear_info_records":
+                if not self.spec_algorithm.is_dflash() or not hasattr(
+                    self.draft_worker, "clear_info_records"
+                ):
+                    logging.warning(
+                        "dflash_clear_info_records requires a DFlash draft worker."
+                    )
+                    if_success = False
+                    break
+            elif k == "eagle_clear_info_records":
+                if not self.spec_algorithm.is_eagle() or not hasattr(
+                    self.draft_worker, "clear_info_records"
+                ):
+                    logging.warning(
+                        "eagle_clear_info_records requires an Eagle draft worker."
                     )
                     if_success = False
                     break
