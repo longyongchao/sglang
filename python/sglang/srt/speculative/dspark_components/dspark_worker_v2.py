@@ -241,18 +241,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{self._simulate_acc_len}."
             )
 
-        self._verify_executor = TargetVerifyExecutor(
-            target_worker=self.target_worker,
-            gamma=self.gamma,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-            kv_injector=self._kv_injector,
-            verify_epilogue=self._verify_epilogue,
-            simulate_acc_len=self._simulate_acc_len,
-        )
-
-        self._forced_budget_frac: Optional[float] = None
-
         self._observers = DsparkStepObservers(
             planner=self._verify_planner,
             gamma=self.gamma,
@@ -261,7 +249,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
-        self._proposer.attach_segment_fn(self._observers.segment)
+
+        self._verify_executor = TargetVerifyExecutor(
+            target_worker=self.target_worker,
+            gamma=self.gamma,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            model_runner=self.model_runner,
+            kv_injector=self._kv_injector,
+            verify_epilogue=self._verify_epilogue,
+            simulate_acc_len=self._simulate_acc_len,
+            segment_fn=self._observers.segment,
+        )
+
+        self._forced_budget_frac: Optional[float] = None
+
+        self._proposer.attach_segment_fn(
+            self._observers.segment,
+            profiling_active_fn=lambda: self._observers.profiling_active,
+        )
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -618,18 +623,21 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
-        accept = self._verify_executor.accept_and_finalize(
-            folded_accept=folded_accept,
-            bs=bs,
-            verify_ids_2d=verify_ids_2d,
-            target_logits=logits_output.next_token_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            layout=layout,
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
-        )
+        if self._observers.profiling_active:
+            folded_accept = False
+        with self._observers.segment(InfoSegment.ACCEPT_BONUS):
+            accept = self._verify_executor.accept_and_finalize(
+                folded_accept=folded_accept,
+                bs=bs,
+                verify_ids_2d=verify_ids_2d,
+                target_logits=logits_output.next_token_logits,
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                layout=layout,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+            )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)

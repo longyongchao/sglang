@@ -293,14 +293,18 @@ class DraftBlockProposer:
         self._dp_moe_sync = dp_moe_sync
         self._draft_temperature = draft_temperature
         self._segment_fn: Optional[Callable[[str], ContextManager[None]]] = None
+        self._profiling_active_fn: Optional[Callable[[], bool]] = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
 
     def attach_segment_fn(
-        self, segment_fn: Callable[[str], ContextManager[None]]
+        self,
+        segment_fn: Callable[[str], ContextManager[None]],
+        profiling_active_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._segment_fn = segment_fn
+        self._profiling_active_fn = profiling_active_fn
 
     def _base_logits_context(self):
         if self._dp_moe_sync:
@@ -338,9 +342,10 @@ class DraftBlockProposer:
         folded_confidence = None
         confidence_tap = None
         folded = False
-        # When segment_fn is attached (profiling active), skip fold to get
-        # separate timing for base_logits and markov_sample sub-segments.
-        if draft_sampler is not None and fwd.can_run_graph and all_greedy and not _seg:
+        _profiling = bool(self._profiling_active_fn and self._profiling_active_fn())
+        # When profiling is active, skip fold to get separate timing for
+        # base_logits and markov_sample sub-segments.
+        if draft_sampler is not None and fwd.can_run_graph and all_greedy and not _profiling:
             # Fold (skip corrected_logits) when either:
             # 1. All requests are greedy (no rejection sampling needed), OR
             # 2. Draft is deterministic (draft_temp=0): verification uses

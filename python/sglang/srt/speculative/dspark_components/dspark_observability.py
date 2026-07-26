@@ -41,6 +41,8 @@ class InfoComponent(str, Enum):
     DRAFT_BASE_LOGITS_GPU_TIME = "draft_base_logits_gpu_time"
     DRAFT_MARKOV_SAMPLE_GPU_TIME = "draft_markov_sample_gpu_time"
     TARGET_VERIFY_GPU_TIME = "target_verify_gpu_time"
+    TARGET_FORWARD_GPU_TIME = "target_forward_gpu_time"
+    ACCEPT_BONUS_GPU_TIME = "accept_bonus_gpu_time"
     DRAFT_KV_MATERIALIZE_GPU_TIME = "draft_kv_materialize_gpu_time"
     REQS = "reqs"
 
@@ -52,6 +54,8 @@ class InfoSegment(str, Enum):
     DRAFT_BASE_LOGITS = "draft_base_logits"
     DRAFT_MARKOV_SAMPLE = "draft_markov_sample"
     TARGET_VERIFY = "target_verify"
+    TARGET_FORWARD = "target_forward"
+    ACCEPT_BONUS = "accept_bonus"
     DRAFT_KV_MATERIALIZE = "draft_kv_materialize"
 
 
@@ -73,6 +77,11 @@ def resolve_enabled_components() -> set[InfoComponent]:
             InfoComponent.DRAFT_BACKBONE_GPU_TIME,
             InfoComponent.DRAFT_BASE_LOGITS_GPU_TIME,
             InfoComponent.DRAFT_MARKOV_SAMPLE_GPU_TIME,
+        }
+    if InfoComponent.TARGET_VERIFY_GPU_TIME in components:
+        components |= {
+            InfoComponent.TARGET_FORWARD_GPU_TIME,
+            InfoComponent.ACCEPT_BONUS_GPU_TIME,
         }
     return components
 
@@ -127,6 +136,8 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     draft_base_logits_gpu_ms: Optional[float] = None
     draft_markov_sample_gpu_ms: Optional[float] = None
     target_verify_gpu_ms: Optional[float] = None
+    target_forward_gpu_ms: Optional[float] = None
+    accept_bonus_gpu_ms: Optional[float] = None
     draft_kv_materialize_gpu_ms: Optional[float] = None
     reqs: Optional[list[ReqDetail]] = None
 
@@ -240,6 +251,8 @@ class DsparkInfoDumper:
                 InfoComponent.DRAFT_BASE_LOGITS_GPU_TIME,
                 InfoComponent.DRAFT_MARKOV_SAMPLE_GPU_TIME,
                 InfoComponent.DRAFT_KV_MATERIALIZE_GPU_TIME,
+                InfoComponent.TARGET_FORWARD_GPU_TIME,
+                InfoComponent.ACCEPT_BONUS_GPU_TIME,
             }
         )
 
@@ -339,6 +352,10 @@ class DsparkInfoDumper:
             return InfoComponent.DRAFT_MARKOV_SAMPLE_GPU_TIME in self._components
         if segment is InfoSegment.TARGET_VERIFY:
             return InfoComponent.TARGET_VERIFY_GPU_TIME in self._components
+        if segment is InfoSegment.TARGET_FORWARD:
+            return InfoComponent.TARGET_FORWARD_GPU_TIME in self._components
+        if segment is InfoSegment.ACCEPT_BONUS:
+            return InfoComponent.ACCEPT_BONUS_GPU_TIME in self._components
         if segment is InfoSegment.DRAFT_KV_MATERIALIZE:
             return InfoComponent.DRAFT_KV_MATERIALIZE_GPU_TIME in self._components
         return False
@@ -412,6 +429,14 @@ class DsparkInfoDumper:
         if InfoComponent.TARGET_VERIFY_GPU_TIME in self._components:
             record.target_verify_gpu_ms = self._segment_ms(
                 pending, InfoSegment.TARGET_VERIFY
+            )
+        if InfoComponent.TARGET_FORWARD_GPU_TIME in self._components:
+            record.target_forward_gpu_ms = self._segment_ms(
+                pending, InfoSegment.TARGET_FORWARD
+            )
+        if InfoComponent.ACCEPT_BONUS_GPU_TIME in self._components:
+            record.accept_bonus_gpu_ms = self._segment_ms(
+                pending, InfoSegment.ACCEPT_BONUS
             )
         if InfoComponent.DRAFT_KV_MATERIALIZE_GPU_TIME in self._components:
             record.draft_kv_materialize_gpu_ms = self._segment_ms(

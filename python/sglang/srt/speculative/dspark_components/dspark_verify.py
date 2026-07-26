@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional
+from contextlib import nullcontext
+from typing import Callable, ContextManager, Optional
 
 import msgspec
 import torch
@@ -72,6 +73,7 @@ class TargetVerifyExecutor:
         kv_injector: TargetHiddenKvInjector,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
+        segment_fn: Optional[Callable[[str], ContextManager[None]]] = None,
     ) -> None:
         self.target_worker = target_worker
         self.gamma = int(gamma)
@@ -82,6 +84,7 @@ class TargetVerifyExecutor:
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
+        self._segment_fn = segment_fn
 
     def accept_and_finalize(
         self,
@@ -268,12 +271,14 @@ class TargetVerifyExecutor:
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
+        _seg = self._segment_fn
+        with _seg("target_forward") if _seg else nullcontext():
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True,
+            )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
