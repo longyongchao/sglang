@@ -1965,7 +1965,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
 
-        self._observers.observe_decode_step(batch.forward_ct, bs)
+        self._observers.observe_decode_step(batch.forward_iter, bs)
 
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus,

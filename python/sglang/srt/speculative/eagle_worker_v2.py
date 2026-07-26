@@ -677,59 +677,59 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     if (c := self.draft_runner.canary_manager) is not None
                     else contextlib.nullcontext()
                 )
-            with (
-                forward_context(
-                    ForwardContext(
-                        attn_backend=self.draft_attn_backend.attn_backends[i]
+                with (
+                    forward_context(
+                        ForwardContext(
+                            attn_backend=self.draft_attn_backend.attn_backends[i]
+                        )
+                    ),
+                    canary_index_ctx,
+                ):
+                    self._observers.open_per_step_segment()
+                    logits_output = self.draft_runner.forward(forward_batch).logits_output
+                    self._observers.close_per_step_segment()
+                maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
+                maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
+                if self.use_classic_rejection_sampling:
+                    probs = renorm_draft_probs(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info,
+                        True,
+                        self.speculative_draft_temperature,
                     )
-                ),
-                canary_index_ctx,
-            ):
-                self._observers.open_per_step_segment()
-                logits_output = self.draft_runner.forward(forward_batch).logits_output
-                self._observers.close_per_step_segment()
-            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if self.use_classic_rejection_sampling:
-                probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info,
-                    True,
-                    self.speculative_draft_temperature,
+                    topk_p, topk_index = fast_sample(probs, num_samples=1)
+                    draft_probs_list.append(probs)
+                elif self.use_eagle3_rejection_sampling:
+                    probs = renorm_draft_probs(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info,
+                        True,
+                        self.speculative_draft_temperature,
+                    )
+                    topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                elif self.topk == 1 and not _is_hip:
+                    topk_index = torch.argmax(
+                        logits_output.next_token_logits, dim=-1, keepdim=True
+                    )
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                else:
+                    probs = renorm_draft_probs(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info,
+                        self.server_args.speculative_use_rejection_sampling,
+                        self.speculative_draft_temperature,
+                    )
+                    topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
                 )
-                topk_p, topk_index = fast_sample(probs, num_samples=1)
-                draft_probs_list.append(probs)
-            elif self.use_eagle3_rejection_sampling:
-                probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info,
-                    True,
-                    self.speculative_draft_temperature,
-                )
-                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            elif self.topk == 1 and not _is_hip:
-                topk_index = torch.argmax(
-                    logits_output.next_token_logits, dim=-1, keepdim=True
-                )
-                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-            else:
-                probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info,
-                    self.server_args.speculative_use_rejection_sampling,
-                    self.speculative_draft_temperature,
-                )
-                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            maybe_detect_oob(
-                topk_index,
-                0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
-            )
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
-            forward_batch.positions.add_(1)
+                if self.hot_token_id is not None:
+                    topk_index = self.hot_token_id[topk_index]
+                hidden_states = logits_output.hidden_states
+                forward_batch.positions.add_(1)
 
         if self.index_share_for_mtp_iteration:
             forward_batch.topk_indices = None
@@ -1241,7 +1241,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
-            self._observers.observe_decode_step(batch.forward_ct, batch.seq_lens.shape[0])
+            self._observers.observe_decode_step(batch.forward_iter, batch.seq_lens.shape[0])
 
             return batch_output
 
