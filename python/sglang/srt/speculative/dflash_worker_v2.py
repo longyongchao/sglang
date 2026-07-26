@@ -82,24 +82,32 @@ class _DflashDraftSampler:
     tp=1 / no-added-vocab only; TP>1 stays eager in the worker.
     """
 
-    def __init__(self, *, weight, block_size, num_org, org_vocab_start, max_bs):
+    def __init__(self, *, weight, block_size, num_org, org_vocab_start, max_bs, anchor_prediction=False):
         self.weight = weight
         self.block_size = int(block_size)
         self.num_org = int(num_org)
         self.org_vocab_start = int(org_vocab_start)
+        self.anchor_prediction = anchor_prediction
+        self._num_draft = self.block_size if anchor_prediction else self.block_size - 1
         # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty(
-            (int(max_bs) * (self.block_size - 1),),
+            (int(max_bs) * self._num_draft,),
             dtype=torch.int64,
             device=weight.device,
         )
 
     def __call__(self, hidden_states, input_ids=None):
-        # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
         bs = hidden_states.shape[0] // self.block_size
-        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
-            -1, hidden_states.shape[-1]
-        )
+        if self.anchor_prediction:
+            # All block_size positions produce predictions (shifted labels)
+            hs = hidden_states.view(bs, self.block_size, -1).reshape(
+                -1, hidden_states.shape[-1]
+            )
+        else:
+            # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
+            hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
+                -1, hidden_states.shape[-1]
+            )
         if hs.dtype != self.weight.dtype:
             hs = hs.to(self.weight.dtype)
         logits = torch.matmul(hs, self.weight[: self.num_org].T)
@@ -204,6 +212,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
+        self._anchor_prediction = draft_config.anchor_prediction
+        # Number of draft tokens produced per block:
+        # anchor_prediction: all block_size positions produce a next-token prediction.
+        # standard: position 0 is the seeded bonus; positions 1..block_size-1 produce drafts.
+        self._num_draft_tokens = self.block_size if self._anchor_prediction else self.block_size - 1
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -379,6 +392,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             num_org=num_org,
             org_vocab_start=org_vocab_start,
             max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+            anchor_prediction=self._anchor_prediction,
         )
 
     def _maybe_build_domino_sampler(self):
@@ -1691,8 +1705,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             and not need_draft_logits
         ):
             draft_next = self._draft_sampler.out[
-                : bs * (int(self.block_size) - 1)
-            ].view(bs, int(self.block_size) - 1)
+                : bs * self._num_draft_tokens
+            ].view(bs, self._num_draft_tokens)
         else:
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
@@ -1707,20 +1721,32 @@ class DFlashWorkerV2(BaseSpecWorker):
                     return_logits=need_draft_logits,
                 )
             else:
-                draft_next, draft_logits = self._greedy_sample_with_logits(
-                    hidden_states=draft_hidden[:, 1:, :].reshape(
+                if self._anchor_prediction:
+                    # All block_size positions produce predictions
+                    hs_for_head = draft_hidden.reshape(-1, draft_hidden.shape[-1])
+                else:
+                    hs_for_head = draft_hidden[:, 1:, :].reshape(
                         -1, draft_hidden.shape[-1]
-                    ),
+                    )
+                draft_next, draft_logits = self._greedy_sample_with_logits(
+                    hidden_states=hs_for_head,
                     lm_head=lm_head,
                     need_logits=need_draft_logits,
                 )
                 if draft_logits is not None:
-                    draft_logits = draft_logits.view(bs, int(self.block_size) - 1, -1)
-                draft_next = draft_next.view(bs, int(self.block_size) - 1)
+                    draft_logits = draft_logits.view(bs, self._num_draft_tokens, -1)
+                draft_next = draft_next.view(bs, self._num_draft_tokens)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+        if self._anchor_prediction:
+            # anchor_prediction training: the draft model's position 0 also produces
+            # a prediction, but at serving time we keep the same [anchor, d1..d_{bs-1}]
+            # verify format. draft_next has block_size tokens; we take positions 1..bs-1
+            # (corresponding to predictions shifted from positions 0..bs-2).
+            draft_tokens[:, 1:].copy_(draft_next[:, :int(self.block_size) - 1])
+        else:
+            draft_tokens[:, 1:].copy_(draft_next)
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.

@@ -434,6 +434,7 @@ class DFlashDraftConfig:
     emb_dim: Optional[int] = None
     pure_draft_prefix_len: int = 0
     shift_label: bool = False
+    anchor_prediction: bool = False
 
     def require_num_layers(self) -> int:
         if self.num_hidden_layers is None:
@@ -578,6 +579,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     shift_label = dflash_cfg.get("shift_label", False)
     if not isinstance(shift_label, bool):
         raise ValueError("DFLASH dflash_config.shift_label must be a bool.")
+    anchor_prediction = bool(dflash_cfg.get("anchor_prediction", False))
     if is_dflash_domino_projector(projector_type):
         if gru_hidden_dim is None or emb_dim is None:
             raise ValueError(
@@ -600,6 +602,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         emb_dim=emb_dim,
         pure_draft_prefix_len=pure_draft_prefix_len,
         shift_label=shift_label,
+        anchor_prediction=anchor_prediction,
     )
 
 
