@@ -320,7 +320,7 @@ class DraftBlockProposer:
     ) -> DraftProposal:
         embed_module = target_model.get_input_embeddings()
         _seg = self._segment_fn
-        with _seg("draft_forward") if _seg else nullcontext():
+        with _seg("draft_backbone") if _seg else nullcontext():
             fwd = self._run_forward(
                 batch=batch,
                 draft_input=draft_input,

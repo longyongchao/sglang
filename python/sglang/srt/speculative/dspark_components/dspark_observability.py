@@ -37,7 +37,7 @@ class InfoComponent(str, Enum):
     STEP_CPU_TIME = "step_cpu_time"
     STEP_GPU_TIME = "step_gpu_time"
     DRAFT_GPU_TIME = "draft_gpu_time"
-    DRAFT_FORWARD_GPU_TIME = "draft_forward_gpu_time"
+    DRAFT_BACKBONE_GPU_TIME = "draft_backbone_gpu_time"
     DRAFT_BASE_LOGITS_GPU_TIME = "draft_base_logits_gpu_time"
     DRAFT_MARKOV_SAMPLE_GPU_TIME = "draft_markov_sample_gpu_time"
     TARGET_VERIFY_GPU_TIME = "target_verify_gpu_time"
@@ -47,7 +47,7 @@ class InfoComponent(str, Enum):
 class InfoSegment(str, Enum):
     STEP = "step"
     DRAFT = "draft"
-    DRAFT_FORWARD = "draft_forward"
+    DRAFT_BACKBONE = "draft_backbone"
     DRAFT_BASE_LOGITS = "draft_base_logits"
     DRAFT_MARKOV_SAMPLE = "draft_markov_sample"
     TARGET_VERIFY = "target_verify"
@@ -66,7 +66,7 @@ def resolve_enabled_components() -> set[InfoComponent]:
         components |= {InfoComponent.CORE, InfoComponent.STEP_CPU_TIME}
     if InfoComponent.DRAFT_GPU_TIME in components:
         components |= {
-            InfoComponent.DRAFT_FORWARD_GPU_TIME,
+            InfoComponent.DRAFT_BACKBONE_GPU_TIME,
             InfoComponent.DRAFT_BASE_LOGITS_GPU_TIME,
             InfoComponent.DRAFT_MARKOV_SAMPLE_GPU_TIME,
         }
@@ -119,7 +119,7 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     step_cpu_ms: Optional[float] = None
     step_gpu_ms: Optional[float] = None
     draft_gpu_ms: Optional[float] = None
-    draft_forward_gpu_ms: Optional[float] = None
+    draft_backbone_gpu_ms: Optional[float] = None
     draft_base_logits_gpu_ms: Optional[float] = None
     draft_markov_sample_gpu_ms: Optional[float] = None
     target_verify_gpu_ms: Optional[float] = None
@@ -313,8 +313,8 @@ class DsparkInfoDumper:
             return InfoComponent.STEP_GPU_TIME in self._components
         if segment is InfoSegment.DRAFT:
             return InfoComponent.DRAFT_GPU_TIME in self._components
-        if segment is InfoSegment.DRAFT_FORWARD:
-            return InfoComponent.DRAFT_FORWARD_GPU_TIME in self._components
+        if segment is InfoSegment.DRAFT_BACKBONE:
+            return InfoComponent.DRAFT_BACKBONE_GPU_TIME in self._components
         if segment is InfoSegment.DRAFT_BASE_LOGITS:
             return InfoComponent.DRAFT_BASE_LOGITS_GPU_TIME in self._components
         if segment is InfoSegment.DRAFT_MARKOV_SAMPLE:
@@ -377,9 +377,9 @@ class DsparkInfoDumper:
             record.step_gpu_ms = self._segment_ms(pending, InfoSegment.STEP)
         if InfoComponent.DRAFT_GPU_TIME in self._components:
             record.draft_gpu_ms = self._segment_ms(pending, InfoSegment.DRAFT)
-        if InfoComponent.DRAFT_FORWARD_GPU_TIME in self._components:
-            record.draft_forward_gpu_ms = self._segment_ms(
-                pending, InfoSegment.DRAFT_FORWARD
+        if InfoComponent.DRAFT_BACKBONE_GPU_TIME in self._components:
+            record.draft_backbone_gpu_ms = self._segment_ms(
+                pending, InfoSegment.DRAFT_BACKBONE
             )
         if InfoComponent.DRAFT_BASE_LOGITS_GPU_TIME in self._components:
             record.draft_base_logits_gpu_ms = self._segment_ms(
