@@ -623,8 +623,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
-        if self._observers.profiling_active:
-            folded_accept = False
         with self._observers.segment(InfoSegment.ACCEPT_BONUS):
             accept = self._verify_executor.accept_and_finalize(
                 folded_accept=folded_accept,
@@ -645,8 +643,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 on_publish(accept.new_seq_lens)
 
         folded_commit = folded_accept and epilogue.folds_commit
-        if self._observers.profiling_active:
-            folded_commit = False
         if not folded_commit:
             with self._observers.segment(InfoSegment.DRAFT_KV_MATERIALIZE):
                 self._verify_executor.commit_hidden(

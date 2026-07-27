@@ -1728,13 +1728,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         draft_logits = None  # [bs, block_size-1, vocab] when non-greedy TP=1
 
-        _profiling = self._observers.profiling_active
         if (
             self._domino_sampler is not None
             and draft_out.can_run_graph
             and bs <= self._domino_sampler.max_bs
             and not need_draft_logits
-            and not _profiling
         ):
             draft_next = self._domino_sampler.out[:bs]
         elif (
@@ -1742,7 +1740,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             and self._draft_sampler is not None
             and draft_out.can_run_graph
             and not need_draft_logits
-            and not _profiling
         ):
             draft_next = self._draft_sampler.out[
                 : bs * self._num_draft_tokens

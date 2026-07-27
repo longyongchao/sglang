@@ -342,10 +342,7 @@ class DraftBlockProposer:
         folded_confidence = None
         confidence_tap = None
         folded = False
-        _profiling = bool(self._profiling_active_fn and self._profiling_active_fn())
-        # When profiling is active, skip fold to get separate timing for
-        # base_logits and markov_sample sub-segments.
-        if draft_sampler is not None and fwd.can_run_graph and all_greedy and not _profiling:
+        if draft_sampler is not None and fwd.can_run_graph and all_greedy:
             # Fold (skip corrected_logits) when either:
             # 1. All requests are greedy (no rejection sampling needed), OR
             # 2. Draft is deterministic (draft_temp=0): verification uses

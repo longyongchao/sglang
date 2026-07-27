@@ -243,18 +243,8 @@ class DsparkInfoDumper:
 
     @property
     def profiling_active(self) -> bool:
-        """True when sub-segment profiling is enabled (requires eager paths)."""
-        return self.enabled and bool(
-            self._components
-            & {
-                InfoComponent.DRAFT_BACKBONE_GPU_TIME,
-                InfoComponent.DRAFT_BASE_LOGITS_GPU_TIME,
-                InfoComponent.DRAFT_MARKOV_SAMPLE_GPU_TIME,
-                InfoComponent.DRAFT_KV_MATERIALIZE_GPU_TIME,
-                InfoComponent.TARGET_FORWARD_GPU_TIME,
-                InfoComponent.ACCEPT_BONUS_GPU_TIME,
-            }
-        )
+        """Always False — profiling no longer bypasses CUDA graph fold."""
+        return False
 
     def segment(self, name: Union[InfoSegment, str]) -> ContextManager[None]:
         if not self.enabled:

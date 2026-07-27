@@ -166,14 +166,8 @@ class EagleInfoDumper:
 
     @property
     def profiling_active(self) -> bool:
-        """True when per-step or draft sub-segments are enabled (requires eager path)."""
-        return self.enabled and bool(
-            self._components
-            & {
-                EagleInfoComponent.DRAFT_PER_STEP_GPU_TIME,
-                EagleInfoComponent.DRAFT_FORWARD_STEPS_GPU_TIME,
-            }
-        )
+        """Always False — profiling no longer bypasses CUDA graph fold."""
+        return False
 
     def begin_step(self) -> None:
         if not self.enabled:

@@ -525,8 +525,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         with canary_outside_ctx:
             # Run draft
-            _profiling = self._observers.profiling_active
-            if can_cuda_graph and not _profiling:
+            if can_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )

@@ -170,16 +170,8 @@ class DFlashInfoDumper:
 
     @property
     def profiling_active(self) -> bool:
-        """True when sub-draft segments are enabled (requires eager path)."""
-        return self.enabled and bool(
-            self._components
-            & {
-                DFlashInfoComponent.DRAFT_BACKBONE_GPU_TIME,
-                DFlashInfoComponent.DRAFT_SAMPLING_GPU_TIME,
-                DFlashInfoComponent.DRAFT_BASE_LOGITS_GPU_TIME,
-                DFlashInfoComponent.DRAFT_GRU_CORRECT_GPU_TIME,
-            }
-        )
+        """Always False — profiling no longer bypasses CUDA graph fold."""
+        return False
 
     def begin_step(self) -> None:
         if not self.enabled:
