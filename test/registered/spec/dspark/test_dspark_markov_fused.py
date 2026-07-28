@@ -161,6 +161,42 @@ def test_gated_dispatch_uses_eager_sampling():
     assert torch.equal(sampler.out[:gamma].view(1, gamma), expected)
 
 
+@pytest.mark.parametrize("head_cls", [VanillaMarkov, RNNHead])
+def test_draft_sampler_batched_matches_eager(head_cls):
+    """bs>1 走 fused：anchor 是 input_ids.view(bs, gamma)[:, 0] 的跨步视图，
+    kernel 必须按 stride 读取，否则除第 0 行外都会取到错误的 prev token。"""
+    torch.manual_seed(13)
+    dtype = torch.bfloat16
+    vocab_size, rank, hidden_size, gamma, bs = 512, 32, 64, 15, 8
+    mask_token_id = vocab_size - 1
+    kwargs = dict(vocab_size=vocab_size, markov_rank=rank)
+    if head_cls is RNNHead:
+        kwargs["hidden_size"] = hidden_size
+    head = head_cls(**kwargs).cuda().to(dtype).eval()
+
+    base_logits = torch.randn(bs * gamma, vocab_size, device="cuda", dtype=dtype)
+    hidden = torch.randn(bs * gamma, hidden_size, device="cuda", dtype=dtype)
+    # production 布局：每行只有第 0 列是真实 bonus token，其余是 mask token
+    ids_2d = torch.full((bs, gamma), mask_token_id, device="cuda", dtype=torch.long)
+    ids_2d[:, 0] = torch.randint(0, vocab_size - 1, (bs,), device="cuda")
+    input_ids = ids_2d.flatten()
+
+    expected, _ = head.sample_block(
+        base_logits.view(bs, gamma, -1),
+        first_prev_tokens=ids_2d[:, 0].contiguous(),
+        hidden_states=hidden.view(bs, gamma, -1),
+        sampler=greedy_step_sampler,
+    )
+    sampler = DsparkDraftSampler(
+        model=_DraftModel(head, base_logits),
+        gamma=gamma,
+        max_bs=bs,
+        device=torch.device("cuda"),
+    )
+    sampler(hidden, input_ids)
+    assert torch.equal(sampler.out[: bs * gamma].view(bs, gamma), expected)
+
+
 @pytest.mark.parametrize("head_cls", [VanillaMarkov, RNNHead, GatedMarkovHead])
 def test_draft_sampler_cuda_graph_capture_replay(head_cls):
     torch.manual_seed(11)

@@ -39,6 +39,7 @@ def _dspark_fused_markov_bias_argmax_kernel(
     V_EMB,  # embedding table vocab size (for bounds check)
     # Strides
     stride_et_v, stride_et_r,
+    stride_prev_b,
     stride_latent_b, stride_latent_r,
     stride_f2_v, stride_f2_r,
     stride_base_b, stride_base_v,
@@ -58,7 +59,7 @@ def _dspark_fused_markov_bias_argmax_kernel(
 
     # Load the latent vector [R] for this batch element
     if FROM_TABLE:
-        tok_id_raw = tl.load(prev_tokens_ptr + pid_b)
+        tok_id_raw = tl.load(prev_tokens_ptr + pid_b * stride_prev_b)
         tok_in_range = (tok_id_raw >= 0) & (tok_id_raw < V_EMB)
         tok_id = tl.where(tok_in_range, tok_id_raw, 0)
 
@@ -282,10 +283,14 @@ def fused_markov_bias_argmax(
         latent_arg = out_val  # unused, just need a valid ptr
         latent_stride_b = 0
         latent_stride_r = 0
+        # prev_tokens is often a strided view (e.g. input_ids.view(B, gamma)[:, 0]),
+        # so its row stride must be passed through instead of assumed to be 1.
+        prev_stride_b = prev_tokens.stride(0)
     else:
         latent_arg = latent
         latent_stride_b = latent.stride(0)
         latent_stride_r = latent.stride(1)
+        prev_stride_b = 0
 
     grid_main = (num_v_blocks, B)
     _dspark_fused_markov_bias_argmax_kernel[grid_main](
@@ -294,6 +299,7 @@ def fused_markov_bias_argmax(
         out_val, out_idx,
         R, V, V_EMB,
         embed_table.stride(0), embed_table.stride(1),
+        prev_stride_b,
         latent_stride_b, latent_stride_r,
         fc2_weight.stride(0), fc2_weight.stride(1),
         base_logits.stride(0), base_logits.stride(1),
