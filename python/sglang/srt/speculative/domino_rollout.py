@@ -25,7 +25,6 @@ _DOMINO_CANDIDATE_BLOCK_C = 512
 _DOMINO_CANDIDATE_POOL_SIZE = 0  # Disable candidate pool; use full-vocab scoring like DSpark
 _DOMINO_TP_SCORER_CUSHION_MB = 2048
 _DOMINO_TP_GRU_TABLE_CUSHION_MB = 1024
-_DOMINO_FOLD_LOGITS_BUDGET_MB = 128
 
 
 class DFlashDominoRollout:
@@ -1018,23 +1017,27 @@ class DFlashDominoRollout:
         no added vocab).'''
 
         num_draft = self.block_size - 1
-        # The in-graph base_logits temporary dominates fold memory; cap the
-        # folded batch size so it stays within a fixed budget. Larger batches
-        # fall back to the eager rollout path. Snap the cap to an actually
-        # captured batch size so any replayed graph serving bs <= fold_max_bs
-        # is guaranteed to contain the folded rollout.
-        per_bs_bytes = num_draft * int(num_org) * lm_head.weight.element_size()
-        budget_bytes = _DOMINO_FOLD_LOGITS_BUDGET_MB * 1024 * 1024
-        budget_max_bs = budget_bytes // per_bs_bytes
-        fold_bs_candidates = [int(b) for b in capture_bs_list if int(b) <= budget_max_bs]
-        if not fold_bs_candidates:
+        # The in-graph base_logits temporary dominates fold memory. It is
+        # allocated inside the draft capture, so it comes from the shared
+        # cuda-graph memory pool: because captures run in decreasing batch
+        # size order, the pool is sized by the largest captured batch size
+        # rather than by their sum. Fold every captured batch size so no
+        # batch size silently falls back to the eager rollout.
+        capture_bs = [int(b) for b in capture_bs_list]
+        if not capture_bs:
             logger.warning(
-                "[DFLASH Domino] rollout fold disabled: base_logits budget "
-                "(%d MiB) cannot cover the smallest capture batch size.",
-                _DOMINO_FOLD_LOGITS_BUDGET_MB,
+                "[DFLASH Domino] rollout fold disabled: empty capture batch "
+                "size list."
             )
             return None
-        fold_max_bs = max(fold_bs_candidates)
+        fold_max_bs = max(capture_bs)
+        fold_logits_mib = (
+            fold_max_bs
+            * num_draft
+            * int(num_org)
+            * lm_head.weight.element_size()
+            / (1024 * 1024)
+        )
         state = self.domino_helper.get_rollout_state()
         embed_module = target_model.get_input_embeddings()
         gru_input_table = self.domino_helper.get_gru_input_proj_table(
@@ -1046,9 +1049,10 @@ class DFlashDominoRollout:
         )
         logger.info(
             "[DFLASH Domino] rollout folded into the draft cuda graph "
-            "(fold_max_bs=%d, candidate_pool_size=%d).",
+            "(fold_max_bs=%d, candidate_pool_size=%d, base_logits=%.0f MiB).",
             fold_max_bs,
             candidate_pool_size,
+            fold_logits_mib,
         )
         return DominoDraftSampler(
             rollout=self,
@@ -1324,6 +1328,7 @@ class DominoDraftSampler:
         self.candidate_pool_size = max(0, int(candidate_pool_size))
         self.shift_label = bool(shift_label)
         self.max_bs = int(max_bs)
+        self._warned_over_max_bs = False
         self.emb_dim = int(state["w_z"].shape[0])
         self.num_score_blocks = (
             (self.candidate_pool_size + _DOMINO_CANDIDATE_BLOCK_C - 1)
@@ -1347,8 +1352,17 @@ class DominoDraftSampler:
     def __call__(self, hidden_states: torch.Tensor, input_ids=None) -> None:
         bs = hidden_states.shape[0] // self.block_size
         if bs > self.max_bs:
-            # Graphs beyond the fold cap skip the fold entirely; the worker
-            # runs the eager rollout for those batch sizes.
+            # Should be unreachable: max_bs covers every captured batch size.
+            # Warn loudly because the worker silently runs the eager rollout
+            # here, which changes the measured draft latency.
+            if not self._warned_over_max_bs:
+                self._warned_over_max_bs = True
+                logger.warning(
+                    "[DFLASH Domino] rollout fold skipped for bs=%d > "
+                    "fold_max_bs=%d; falling back to the eager rollout.",
+                    bs,
+                    self.max_bs,
+                )
             return
         rollout = self.rollout
         state = self.state
