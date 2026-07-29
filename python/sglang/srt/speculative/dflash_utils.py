@@ -27,6 +27,7 @@ def is_dflash_domino_projector(projector_type: Optional[str]) -> bool:
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
+_DFLASH_ZERO_DRAFT_PROBS: dict[tuple[Optional[int], int, int], torch.Tensor] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
         "FlashInferAttnBackend",
@@ -290,6 +291,35 @@ def _get_or_create_chain_verify_buffers(
         accept_index,
         accept_token_num,
     )
+
+
+def _get_or_create_zero_draft_probs(
+    *,
+    bs: int,
+    draft_token_num: int,
+    vocab: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Zeroed ``[bs, draft_token_num, vocab]`` scratch for target-only sampling.
+
+    ``tree_speculative_sampling_target_only`` treats ``draft_probs`` as scratch
+    (it writes the target prob of every rejected draft into it), so the buffer
+    has to be zeroed on every call but does not have to be reallocated. At
+    ``bs=128``/``block=16``/``vocab=151936`` this is a ~1 GiB tensor, so it grows
+    to exactly the largest batch seen instead of doubling.
+    """
+    key = (device.index, int(draft_token_num), int(vocab))
+    cached = _DFLASH_ZERO_DRAFT_PROBS.get(key)
+    if cached is None or cached.shape[0] < bs:
+        cached = torch.zeros(
+            (int(bs), int(draft_token_num), int(vocab)),
+            dtype=torch.float32,
+            device=device,
+        )
+        _DFLASH_ZERO_DRAFT_PROBS[key] = cached
+    draft_probs = cached[:bs]
+    draft_probs.zero_()
+    return draft_probs
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:

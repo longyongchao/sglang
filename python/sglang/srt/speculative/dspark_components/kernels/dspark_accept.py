@@ -10,6 +10,7 @@ import triton.language as tl
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
+    _get_or_create_zero_draft_probs,
     build_dflash_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
     tree_speculative_sampling_target_only,
@@ -128,7 +129,14 @@ def _accept_sampling_core(
             "Target-only speculative sampling requires the sgl-kernel sampling ops."
         )
     sampling_draft_probs = (
-        torch.zeros_like(target_probs) if draft_probs is None else draft_probs
+        _get_or_create_zero_draft_probs(
+            bs=bs,
+            draft_token_num=verify_num_draft_tokens,
+            vocab=target_probs.shape[-1],
+            device=device,
+        )
+        if draft_probs is None
+        else draft_probs
     )
     candidates_i64 = (
         candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)

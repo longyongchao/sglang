@@ -1318,7 +1318,7 @@ class Scheduler(
             request_lengths = []
             for req in batch.reqs:
                 start = len(req.prefix_indices)
-                end = start + req.extend_range.length
+                end = start + req.extend_input_len
                 fill_ids = req.origin_input_ids + req.output_ids
                 if start == 0:
                     tokens = fill_ids[start:end]
@@ -2657,10 +2657,9 @@ class Scheduler(
 
             # Stash (cache) the previous chunk only when it produced new KV
             # beyond what is already cached. A parked chunk (add_chunked_req
-            # hybrid-SWA early-return) leaves extend_range.end ==
-            # len(prefix_indices), so there is nothing new to cache and
-            # stashing would be a no-op.
-            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+            # hybrid-SWA early-return) leaves fill_len == len(prefix_indices),
+            # so there is nothing new to cache and stashing would be a no-op.
+            if self.chunked_req.fill_len > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
@@ -3009,7 +3008,7 @@ class Scheduler(
 
         if getattr(self.tp_worker.model_runner, "prefill_aware_swa", False):
             for req in can_run_list:
-                req.swa_evict_floor = req.extend_range.end
+                req.swa_evict_floor = req.fill_len
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -3018,7 +3017,7 @@ class Scheduler(
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
-                    self.chunked_req.extend_range.length
+                    self.chunked_req.extend_input_len
                     if self.chunked_req is not None
                     else 0
                 ),
@@ -3390,8 +3389,7 @@ class Scheduler(
             # we can use the correct values in output processing.
             if batch.return_logprob:
                 batch_result.extend_input_len_per_req = [
-                    req.extend_range.length if req.extend_range is not None else 0
-                    for req in batch.reqs
+                    req.extend_input_len for req in batch.reqs
                 ]
                 batch_result.extend_logprob_start_len_per_req = (
                     batch.extend_logprob_start_lens
