@@ -1,7 +1,8 @@
 """Fused Triton kernels for the DSpark Markov head sampling loop.
 
 Reduces per-step kernel count for the greedy sampling path:
-- Vanilla: from ~6 ops to 2 kernels (fused_markov_bias_argmax, two passes)
+- Vanilla: from ~6 ops to 3 kernels (index_select + fused_markov_bias_argmax,
+  two passes)
 - RNN: from ~11 ops to 4 kernels (cuBLAS matmul + fused_rnn_cell +
   fused_markov_bias_argmax two passes)
 
@@ -16,16 +17,14 @@ import triton.language as tl
 
 
 # ---------------------------------------------------------------------------
-# Kernel 1: Fused embedding lookup @ markov_w2.T + base_logits -> argmax
+# Kernel 1: Fused latent @ markov_w2.T + base_logits -> argmax
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
 def _dspark_fused_markov_bias_argmax_kernel(
-    # Input: either embed_table lookup by token id, or pre-computed latent
-    embed_table_ptr,  # [V_emb, R] embedding table (markov_w1.weight)
-    prev_tokens_ptr,  # [B] int64 previous token ids
-    latent_ptr,  # [B, R] pre-computed latent (used when FROM_TABLE=False)
+    # Input: pre-computed latent (embedding row for vanilla, RNN output for rnn)
+    latent_ptr,  # [B, R]
     # Projection weight
     fc2_ptr,  # [V, R] markov_w2.weight
     # Base logits to add
@@ -34,12 +33,9 @@ def _dspark_fused_markov_bias_argmax_kernel(
     out_val_ptr,  # [B, num_v_blocks] fp32
     out_idx_ptr,  # [B, num_v_blocks] int32
     # Dimensions
-    R,  # markov_rank (hidden dim of embedding)
+    R,  # markov_rank (hidden dim of the latent)
     V,  # vocab_size
-    V_EMB,  # embedding table vocab size (for bounds check)
     # Strides
-    stride_et_v, stride_et_r,
-    stride_prev_b,
     stride_latent_b, stride_latent_r,
     stride_f2_v, stride_f2_r,
     stride_base_b, stride_base_v,
@@ -48,7 +44,6 @@ def _dspark_fused_markov_bias_argmax_kernel(
     # Compile-time constants
     BLOCK_V: tl.constexpr,
     BLOCK_R: tl.constexpr,
-    FROM_TABLE: tl.constexpr,
 ):
     """Pass 1: per-tile matmul + base_logits + local argmax."""
     # 批维放在 grid 的最快变化轴上：相邻 CTA 共享同一个 v 分块，fc2 的
@@ -60,12 +55,6 @@ def _dspark_fused_markov_bias_argmax_kernel(
     offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
     mask_v = offs_v < V
 
-    # Load the latent vector [R] for this batch element
-    if FROM_TABLE:
-        tok_id_raw = tl.load(prev_tokens_ptr + pid_b * stride_prev_b)
-        tok_in_range = (tok_id_raw >= 0) & (tok_id_raw < V_EMB)
-        tok_id = tl.where(tok_in_range, tok_id_raw, 0)
-
     # Accumulate dot product: latent[R] @ fc2_weight[BLOCK_V, R].T
     acc = tl.zeros([BLOCK_V], dtype=tl.float32)
 
@@ -74,18 +63,11 @@ def _dspark_fused_markov_bias_argmax_kernel(
         mask_r = offs_r < R
 
         # Load latent slice [BLOCK_R]
-        if FROM_TABLE:
-            latent_block = tl.load(
-                embed_table_ptr + tok_id * stride_et_v + offs_r * stride_et_r,
-                mask=mask_r & tok_in_range,
-                other=0.0,
-            ).to(tl.float32)
-        else:
-            latent_block = tl.load(
-                latent_ptr + pid_b * stride_latent_b + offs_r * stride_latent_r,
-                mask=mask_r,
-                other=0.0,
-            ).to(tl.float32)
+        latent_block = tl.load(
+            latent_ptr + pid_b * stride_latent_b + offs_r * stride_latent_r,
+            mask=mask_r,
+            other=0.0,
+        ).to(tl.float32)
 
         # Load fc2 slice [BLOCK_V, BLOCK_R]
         fc2_ptrs = (
@@ -256,62 +238,44 @@ def _dspark_fused_rnn_cell_kernel(
 
 def fused_markov_bias_argmax(
     *,
-    prev_tokens: torch.Tensor,       # [B] int64
-    embed_table: torch.Tensor,       # [V_emb, R] markov_w1.weight
+    latent: torch.Tensor,            # [B, R] materialized latent
     fc2_weight: torch.Tensor,        # [V, R] markov_w2.weight
     base_logits: torch.Tensor,       # [B, V]
     out_val: torch.Tensor,           # [B, num_v_blocks] fp32 scratch
     out_idx: torch.Tensor,           # [B, num_v_blocks] int32 scratch
     final_token: torch.Tensor,       # [B] int64 destination
-    latent: torch.Tensor | None = None,  # [B, R] pre-computed (RNN output_emb)
     block_v: int = 512,
     block_r: int = 32,
     num_warps: int = 4,
     num_stages: int = 3,
 ) -> None:
-    """Fused: embed_table[prev_token] @ fc2_weight.T + base_logits -> argmax.
+    """Fused: ``latent @ fc2_weight.T + base_logits`` -> argmax.
 
-    When ``latent`` is provided, uses it directly instead of the table lookup
-    (for RNN heads where the latent is tanh(output_raw) from the RNN cell).
+    ``latent`` must already be materialized as a contiguous ``[B, R]`` tensor
+    (the embedding row for the vanilla head, ``tanh(output_raw)`` for the RNN
+    head). Doing the embedding lookup inside the kernel instead would re-gather
+    the same table row from every one of the ``B * ceil(V / BLOCK_V)`` CTAs of
+    every step, which made draft latency scale steeply with batch size.
     """
     B = base_logits.shape[0]
     V = base_logits.shape[1]
     R = fc2_weight.shape[1]
-    V_EMB = embed_table.shape[0]
     num_v_blocks = (V + block_v - 1) // block_v
-    from_table = latent is None
-
-    # Placeholder pointers for unused paths
-    if from_table:
-        latent_arg = out_val  # unused, just need a valid ptr
-        latent_stride_b = 0
-        latent_stride_r = 0
-        # prev_tokens is often a strided view (e.g. input_ids.view(B, gamma)[:, 0]),
-        # so its row stride must be passed through instead of assumed to be 1.
-        prev_stride_b = prev_tokens.stride(0)
-    else:
-        latent_arg = latent
-        latent_stride_b = latent.stride(0)
-        latent_stride_r = latent.stride(1)
-        prev_stride_b = 0
 
     # dim0 必须是批维，见 kernel 内的 L2 复用说明。
     grid_main = (B, num_v_blocks)
     _dspark_fused_markov_bias_argmax_kernel[grid_main](
-        embed_table, prev_tokens, latent_arg,
+        latent,
         fc2_weight, base_logits,
         out_val, out_idx,
-        R, V, V_EMB,
-        embed_table.stride(0), embed_table.stride(1),
-        prev_stride_b,
-        latent_stride_b, latent_stride_r,
+        R, V,
+        latent.stride(0), latent.stride(1),
         fc2_weight.stride(0), fc2_weight.stride(1),
         base_logits.stride(0), base_logits.stride(1),
         out_val.stride(0), out_val.stride(1),
         out_idx.stride(0), out_idx.stride(1),
         BLOCK_V=block_v,
         BLOCK_R=block_r,
-        FROM_TABLE=from_table,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -368,13 +332,14 @@ class MarkovFusedScratch:
         self.out_val = torch.empty((max_bs, num_v_blocks), dtype=torch.float32, device=device)
         self.out_idx = torch.empty((max_bs, num_v_blocks), dtype=torch.int32, device=device)
         self.tok_buf = torch.empty((max_bs,), dtype=torch.int64, device=device)
+        # 两条路径都把 latent 物化到这里再交给 kernel，见
+        # fused_markov_bias_argmax 的 docstring。
+        self.latent_buf = torch.empty((max_bs, markov_rank), dtype=dtype, device=device)
         if is_rnn:
             self.rnn_state_buf = torch.zeros((max_bs, markov_rank), dtype=dtype, device=device)
             self.rnn_new_state_buf = torch.empty((max_bs, markov_rank), dtype=dtype, device=device)
-            self.output_emb_buf = torch.empty((max_bs, markov_rank), dtype=dtype, device=device)
             self.rnn_proj_buf = torch.empty((max_bs, 3 * markov_rank), dtype=dtype, device=device)
         else:
             self.rnn_state_buf = None
             self.rnn_new_state_buf = None
-            self.output_emb_buf = None
             self.rnn_proj_buf = None

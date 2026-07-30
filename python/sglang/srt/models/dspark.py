@@ -149,15 +149,29 @@ class VanillaMarkov(nn.Module):
         if proposal_len == 0:
             return torch.empty(batch_size, 0, dtype=torch.long, device=device)
 
-        embed_table = self.markov_w1.weight  # [V_emb, R]
+        # detach(): 同一块 storage（cuda graph 里的指针不变），但脱离 autograd。
+        # decode 的 cuda graph 捕获没有关梯度（只有 prefill runner 带 @torch.no_grad），
+        # 而权重仍是 requires_grad 的 Parameter，index_select 的 out= 形式在 grad mode
+        # 下会直接抛错。
+        embed_table = self.markov_w1.weight.detach()  # [V_emb, R]
         fc2_weight = self.markov_w2.weight   # [V, R]
+        latent = scratch.latent_buf[:batch_size, : self.markov_rank]
+        # index_select 不像 kernel 内的查表那样静默钳位越界 token，所以这里一次性
+        # 校验 argmax 的值域（< base_logits 的词表宽度）落在 embedding 表内。
+        if base_logits.shape[-1] > embed_table.shape[0]:
+            raise ValueError(
+                "DSpark markov embedding table is narrower than the scored vocab: "
+                f"V_emb={embed_table.shape[0]}, V={base_logits.shape[-1]}."
+            )
 
         prev_tokens = first_prev_tokens.long()
         sampled_tokens = []
         for step_idx in range(proposal_len):
+            # 先把 embedding 行物化成连续的 [B, R]：交给 kernel 按 token id 现查
+            # 会让同一行被该步 B*ceil(V/BLOCK_V) 个 CTA 各 gather 一次。
+            torch.index_select(embed_table, 0, prev_tokens, out=latent)
             fused_markov_bias_argmax(
-                prev_tokens=prev_tokens,
-                embed_table=embed_table,
+                latent=latent,
                 fc2_weight=fc2_weight,
                 base_logits=base_logits[:, step_idx, :],
                 out_val=scratch.out_val[:batch_size],
@@ -325,14 +339,13 @@ class RNNHead(VanillaMarkov):
         if proposal_len == 0:
             return torch.empty(batch_size, 0, dtype=torch.long, device=device)
 
-        embed_table = self.markov_w1.weight  # [V_emb, R]
         fc2_weight = self.markov_w2.weight   # [V, R]
         R = self.markov_rank
 
         # Initialize RNN state to zeros
         state = scratch.rnn_state_buf[:batch_size, :R].zero_()
         new_state = scratch.rnn_new_state_buf[:batch_size, :R]
-        output_emb = scratch.output_emb_buf[:batch_size, :R]
+        output_emb = scratch.latent_buf[:batch_size, :R]
         proj_buf = scratch.rnn_proj_buf[:batch_size]
 
         prev_tokens = first_prev_tokens.long()
@@ -360,14 +373,12 @@ class RNNHead(VanillaMarkov):
             state, new_state = new_state, state
             # Fused argmax: output_emb @ fc2_weight.T + base_logits -> argmax
             fused_markov_bias_argmax(
-                prev_tokens=prev_tokens,
-                embed_table=embed_table,
+                latent=output_emb,
                 fc2_weight=fc2_weight,
                 base_logits=base_logits[:, step_idx, :],
                 out_val=scratch.out_val[:batch_size],
                 out_idx=scratch.out_idx[:batch_size],
                 final_token=scratch.tok_buf[:batch_size],
-                latent=output_emb,
             )
             prev_tokens = scratch.tok_buf[:batch_size]
             sampled_tokens.append(prev_tokens.clone())
