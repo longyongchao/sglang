@@ -21,6 +21,23 @@ import triton.language as tl
 # ---------------------------------------------------------------------------
 
 
+MARKOV_BLOCK_V = 128
+
+
+def _score_block_b(batch_size: int) -> int:
+    """打分 kernel 的批分块大小：``tl.dot`` 要求各维 >= 16，上限取 64。
+
+    分块越大，fc2 的重读次数 ``ceil(B / BLOCK_B)`` 越少；超过 64 后收益反转，
+    因为累加器 ``[BLOCK_B, BLOCK_V]`` 的 SMEM 占用把每 SM 的 CTA 并发压到 1
+    （寄存器未溢出）。
+    """
+    if batch_size <= 16:
+        return 16
+    if batch_size <= 32:
+        return 32
+    return 64
+
+
 @triton.jit
 def _dspark_fused_markov_bias_argmax_kernel(
     # Input: pre-computed latent (embedding row for vanilla, RNN output for rnn)
@@ -33,6 +50,7 @@ def _dspark_fused_markov_bias_argmax_kernel(
     out_val_ptr,  # [B, num_v_blocks] fp32
     out_idx_ptr,  # [B, num_v_blocks] int32
     # Dimensions
+    B,  # batch size
     R,  # markov_rank (hidden dim of the latent)
     V,  # vocab_size
     # Strides
@@ -42,34 +60,42 @@ def _dspark_fused_markov_bias_argmax_kernel(
     stride_outv_b, stride_outv_n,
     stride_outi_b, stride_outi_n,
     # Compile-time constants
+    BLOCK_B: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
     """Pass 1: per-tile matmul + base_logits + local argmax."""
-    # 批维放在 grid 的最快变化轴上：相邻 CTA 共享同一个 v 分块，fc2 的
-    # [BLOCK_V, R] 切片只需从 HBM 读一次，其余批次由 L2 命中。反过来
-    # （v 维在最快轴）会让整张 fc2 被重读 B 次，draft 时延随并发线性上升。
+    # 一个 CTA 同时算 BLOCK_B 个 request：fc2 的 [BLOCK_V, R] 切片进 SMEM 后被
+    # BLOCK_B 行复用，整表读取次数从 B 降到 ceil(B / BLOCK_B)。原来的
+    # 每 request 一个 CTA 只能指望 L2 命中，实测 fc2 仍被按 request 重读，
+    # γ 步循环的时延随并发线性上升（78 MiB × B × 步数）。
+    # 批维仍放在 grid 的最快变化轴上，让共享同一 v 分块的 CTA 相邻调度。
     pid_b = tl.program_id(0)
     pid_v = tl.program_id(1)
 
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = offs_b < B
     offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
     mask_v = offs_v < V
 
-    # Accumulate dot product: latent[R] @ fc2_weight[BLOCK_V, R].T
-    acc = tl.zeros([BLOCK_V], dtype=tl.float32)
+    # Accumulate: latent[BLOCK_B, R] @ fc2_weight[BLOCK_V, R].T
+    acc = tl.zeros([BLOCK_B, BLOCK_V], dtype=tl.float32)
+    fc2_dtype = fc2_ptr.dtype.element_ty
 
     for r_start in range(0, R, BLOCK_R):
         offs_r = r_start + tl.arange(0, BLOCK_R)
         mask_r = offs_r < R
 
-        # Load latent slice [BLOCK_R]
+        # Load latent slice [BLOCK_B, BLOCK_R]
         latent_block = tl.load(
-            latent_ptr + pid_b * stride_latent_b + offs_r * stride_latent_r,
-            mask=mask_r,
+            latent_ptr + offs_b[:, None] * stride_latent_b
+            + offs_r[None, :] * stride_latent_r,
+            mask=mask_b[:, None] & mask_r[None, :],
             other=0.0,
-        ).to(tl.float32)
+        ).to(fc2_dtype)
 
-        # Load fc2 slice [BLOCK_V, BLOCK_R]
+        # fc2 是 [V, R] 行主序，按 [BLOCK_V, BLOCK_R] 读才沿 R 连续（向量化
+        # 访存）；转置交给 tl.dot 的操作数布局吸收，不额外过一趟 SMEM。
         fc2_ptrs = (
             fc2_ptr
             + offs_v[:, None] * stride_f2_v
@@ -80,33 +106,40 @@ def _dspark_fused_markov_bias_argmax_kernel(
             mask=mask_v[:, None] & mask_r[None, :],
             other=0.0,
             cache_modifier=".cg",
-        ).to(tl.float32)
+        )
 
-        acc += tl.sum(fc2_block * latent_block[None, :], axis=1)
+        acc = tl.dot(latent_block, tl.trans(fc2_block), acc)
 
     # 对齐 eager 的原生精度边界：linear 将 fp32 累加结果写回输入精度，
     # 随后的 logits 加法再次写回该精度。
     input_dtype = base_ptr.dtype.element_ty
     projected = acc.to(input_dtype)
     base_block = tl.load(
-        base_ptr + pid_b * stride_base_b + offs_v * stride_base_v,
-        mask=mask_v,
+        base_ptr + offs_b[:, None] * stride_base_b + offs_v[None, :] * stride_base_v,
+        mask=mask_b[:, None] & mask_v[None, :],
         other=-float("inf"),
         cache_modifier=".cg",
     )
     logits = (projected + base_block).to(input_dtype).to(tl.float32)
-    logits = tl.where(mask_v, logits, -float("inf"))
+    logits = tl.where(mask_v[None, :], logits, -float("inf"))
 
     # 字典序 argmax：值较大者优先，值相同时词表索引较小者优先。
-    local_max_val = tl.max(logits, axis=0)
+    local_max_val = tl.max(logits, axis=1)
     local_max_idx = tl.min(
-        tl.where(mask_v & (logits == local_max_val), offs_v, V), axis=0
+        tl.where(
+            mask_v[None, :] & (logits == local_max_val[:, None]), offs_v[None, :], V
+        ),
+        axis=1,
     )
 
-    out_val_offs = pid_b * stride_outv_b + pid_v * stride_outv_n
-    out_idx_offs = pid_b * stride_outi_b + pid_v * stride_outi_n
-    tl.store(out_val_ptr + out_val_offs, local_max_val)
-    tl.store(out_idx_ptr + out_idx_offs, local_max_idx)
+    tl.store(
+        out_val_ptr + offs_b * stride_outv_b + pid_v * stride_outv_n,
+        local_max_val, mask=mask_b,
+    )
+    tl.store(
+        out_idx_ptr + offs_b * stride_outi_b + pid_v * stride_outi_n,
+        local_max_idx, mask=mask_b,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +277,7 @@ def fused_markov_bias_argmax(
     out_val: torch.Tensor,           # [B, num_v_blocks] fp32 scratch
     out_idx: torch.Tensor,           # [B, num_v_blocks] int32 scratch
     final_token: torch.Tensor,       # [B] int64 destination
-    block_v: int = 512,
+    block_v: int = MARKOV_BLOCK_V,
     block_r: int = 32,
     num_warps: int = 4,
     num_stages: int = 3,
@@ -261,19 +294,21 @@ def fused_markov_bias_argmax(
     V = base_logits.shape[1]
     R = fc2_weight.shape[1]
     num_v_blocks = (V + block_v - 1) // block_v
+    block_b = _score_block_b(B)
 
     # dim0 必须是批维，见 kernel 内的 L2 复用说明。
-    grid_main = (B, num_v_blocks)
+    grid_main = ((B + block_b - 1) // block_b, num_v_blocks)
     _dspark_fused_markov_bias_argmax_kernel[grid_main](
         latent,
         fc2_weight, base_logits,
         out_val, out_idx,
-        R, V,
+        B, R, V,
         latent.stride(0), latent.stride(1),
         fc2_weight.stride(0), fc2_weight.stride(1),
         base_logits.stride(0), base_logits.stride(1),
         out_val.stride(0), out_val.stride(1),
         out_idx.stride(0), out_idx.stride(1),
+        BLOCK_B=block_b,
         BLOCK_V=block_v,
         BLOCK_R=block_r,
         num_warps=num_warps,
@@ -328,7 +363,7 @@ class MarkovFusedScratch:
     def __init__(self, *, max_bs: int, vocab_size: int, markov_rank: int,
                  hidden_size: int, device: torch.device, dtype: torch.dtype,
                  is_rnn: bool = False) -> None:
-        num_v_blocks = (vocab_size + 512 - 1) // 512
+        num_v_blocks = (vocab_size + MARKOV_BLOCK_V - 1) // MARKOV_BLOCK_V
         self.out_val = torch.empty((max_bs, num_v_blocks), dtype=torch.float32, device=device)
         self.out_idx = torch.empty((max_bs, num_v_blocks), dtype=torch.int32, device=device)
         self.tok_buf = torch.empty((max_bs,), dtype=torch.int64, device=device)

@@ -36,7 +36,7 @@ def _scratch(head, batch_size, dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("batch_size,proposal_len", [(1, 8), (4, 15)])
+@pytest.mark.parametrize("batch_size,proposal_len", [(1, 8), (4, 15), (129, 4)])
 @pytest.mark.parametrize("head_cls", [VanillaMarkov, RNNHead])
 def test_production_sample_block_parity(
     dtype, batch_size, proposal_len, head_cls

@@ -17,7 +17,7 @@ from sglang.srt.speculative.domino_kernels import (
 
 logger = logging.getLogger(__name__)
 
-_DOMINO_BLOCK_V = 512
+_DOMINO_BLOCK_V = 128
 _DOMINO_BLOCK_M = 32
 _DOMINO_SCORE_NUM_WARPS = 4
 _DOMINO_SCORE_NUM_STAGES = 3

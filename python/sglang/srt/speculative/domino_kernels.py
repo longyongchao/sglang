@@ -22,48 +22,73 @@ import triton
 import triton.language as tl
 
 
+def _score_block_b(batch_size: int) -> int:
+    """打分 kernel 的批分块大小：``tl.dot`` 要求各维 >= 16，上限取 64。
+
+    分块越大，fc2 的重读次数 ``ceil(B / BLOCK_B)`` 越少；超过 64 后收益反转，
+    因为累加器 ``[BLOCK_B, BLOCK_V]`` 的 SMEM 占用把每 SM 的 CTA 并发压到 1
+    （实测 bs=128 下 BLOCK_B 64->128 是 0.079 -> 0.103 ms，寄存器未溢出）。
+    """
+    if batch_size <= 16:
+        return 16
+    if batch_size <= 32:
+        return 32
+    return 64
+
+
 @triton.jit
 def _domino_fused_silu_fc2_argmax_kernel(
     z_ptr, s_ptr,
     fc2_ptr, base_ptr, fc2_bias_ptr,
     out_val_ptr, out_idx_ptr,
-    M, V,
+    B, M, V,
     stride_z_b, stride_z_m,
     stride_s_b, stride_s_m,
     stride_f2_v, stride_f2_m,
     stride_base_b, stride_base_v,
     stride_outv_b, stride_outv_n,
     stride_outi_b, stride_outi_n,
+    BLOCK_B: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     HAS_FC2_BIAS: tl.constexpr,
 ):
-    # 批维放在 grid 的最快变化轴上：相邻 CTA 共享同一个 v 分块，因此
-    # fc2 的 [BLOCK_V, M] 切片只需从 HBM 读一次，其余批次由 L2 命中。
-    # 若把 v 维放在最快轴上，fc2 会被整表重读 B 次（78 MiB × B × 15 步）。
+    # 一个 CTA 同时算 BLOCK_B 个 request：fc2 的 [BLOCK_V, M] 切片进 SMEM 后被
+    # BLOCK_B 行复用，整表读取次数从 B 降到 ceil(B / BLOCK_B)。原来的
+    # 每 request 一个 CTA 只能指望 L2 命中，实测 fc2 仍被按 request 重读，
+    # γ 步循环的时延随并发线性上升（78 MiB × B × 步数）。
+    # 批维仍放在 grid 的最快变化轴上，让共享同一 v 分块的 CTA 相邻调度。
     pid_b = tl.program_id(0)
     pid_v = tl.program_id(1)
 
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = offs_b < B
     offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
     mask_v = offs_v < V
 
-    acc = tl.zeros([BLOCK_V], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_B, BLOCK_V], dtype=tl.float32)
+    fc2_dtype = fc2_ptr.dtype.element_ty
 
     for m_start in range(0, M, BLOCK_M):
         offs_m = m_start + tl.arange(0, BLOCK_M)
         mask_m = offs_m < M
+        mask_bm = mask_b[:, None] & mask_m[None, :]
 
         z_block = tl.load(
-            z_ptr + pid_b * stride_z_b + offs_m * stride_z_m,
-            mask=mask_m, other=0.0,
+            z_ptr + offs_b[:, None] * stride_z_b + offs_m[None, :] * stride_z_m,
+            mask=mask_bm, other=0.0,
         ).to(tl.float32)
         s_block = tl.load(
-            s_ptr + pid_b * stride_s_b + offs_m * stride_s_m,
-            mask=mask_m, other=0.0,
+            s_ptr + offs_b[:, None] * stride_s_b + offs_m[None, :] * stride_s_m,
+            mask=mask_bm, other=0.0,
         ).to(tl.float32)
         preact = z_block + s_block
-        mid_block = preact * tl.sigmoid(preact)
+        # eager 参考实现是 ``F.linear(F.silu(z + s), fc2_w)``，即 mid 落回
+        # 输入精度后交给 cuBLAS 做 bf16 MMA；这里保持同一个精度边界。
+        mid_block = (preact * tl.sigmoid(preact)).to(fc2_dtype)
 
+        # fc2 是 [V, M] 行主序，按 [BLOCK_V, BLOCK_M] 读才沿 M 连续（向量化
+        # 访存）；转置交给 tl.dot 的操作数布局吸收，不额外过一趟 SMEM。
         fc2_ptrs = (
             fc2_ptr
             + offs_v[:, None] * stride_f2_v
@@ -74,33 +99,37 @@ def _domino_fused_silu_fc2_argmax_kernel(
             mask=mask_v[:, None] & mask_m[None, :],
             other=0.0,
             cache_modifier=".cg",
-        ).to(tl.float32)
+        )
 
-        acc += tl.sum(fc2_block * mid_block[None, :], axis=1)
+        acc = tl.dot(mid_block, tl.trans(fc2_block), acc)
 
     if HAS_FC2_BIAS:
         bias_block = tl.load(
             fc2_bias_ptr + offs_v, mask=mask_v, other=0.0
         ).to(tl.float32)
-        acc += bias_block
+        acc += bias_block[None, :]
 
     base_block = tl.load(
-        base_ptr + pid_b * stride_base_b + offs_v * stride_base_v,
-        mask=mask_v, other=-float("inf"),
+        base_ptr + offs_b[:, None] * stride_base_b + offs_v[None, :] * stride_base_v,
+        mask=mask_b[:, None] & mask_v[None, :], other=-float("inf"),
         cache_modifier=".cg",
     ).to(tl.float32)
     acc += base_block
 
-    acc = tl.where(mask_v, acc, -float("inf"))
+    acc = tl.where(mask_v[None, :], acc, -float("inf"))
 
-    local_max_val = tl.max(acc, axis=0)
-    local_max_idx = tl.argmax(acc, axis=0)
+    local_max_val = tl.max(acc, axis=1)
+    local_max_idx = tl.argmax(acc, axis=1)
     global_max_idx = pid_v * BLOCK_V + local_max_idx
 
-    out_val_offs = pid_b * stride_outv_b + pid_v * stride_outv_n
-    out_idx_offs = pid_b * stride_outi_b + pid_v * stride_outi_n
-    tl.store(out_val_ptr + out_val_offs, local_max_val)
-    tl.store(out_idx_ptr + out_idx_offs, global_max_idx)
+    tl.store(
+        out_val_ptr + offs_b * stride_outv_b + pid_v * stride_outv_n,
+        local_max_val, mask=mask_b,
+    )
+    tl.store(
+        out_idx_ptr + offs_b * stride_outi_b + pid_v * stride_outi_n,
+        global_max_idx, mask=mask_b,
+    )
 
 
 @triton.jit
@@ -274,7 +303,7 @@ def fused_silu_fc2_argmax(
     out_val: torch.Tensor,       # [B, num_v_blocks] fp32 scratch
     out_idx: torch.Tensor,       # [B, num_v_blocks] int32 scratch
     final_token: torch.Tensor,   # [B] int64 destination
-    block_v: int = 512,
+    block_v: int = 128,
     block_m: int = 32,
     num_warps: int = 4,
     num_stages: int = 3,
@@ -286,22 +315,24 @@ def fused_silu_fc2_argmax(
     B, M = z_proj.shape
     V = base_logits.shape[1]
     num_v_blocks = (V + block_v - 1) // block_v
+    block_b = _score_block_b(B)
     has_fc2_bias = fc2_bias is not None
     fc2_bias_arg = fc2_bias if has_fc2_bias else out_val  # placeholder ptr
 
     # dim0 必须是批维，见 kernel 内的 L2 复用说明。
-    grid_main = (B, num_v_blocks)
+    grid_main = ((B + block_b - 1) // block_b, num_v_blocks)
     _domino_fused_silu_fc2_argmax_kernel[grid_main](
         z_proj, s_proj,
         fc2_weight, base_logits, fc2_bias_arg,
         out_val, out_idx,
-        M, V,
+        B, M, V,
         z_proj.stride(0), z_proj.stride(1),
         s_proj.stride(0), s_proj.stride(1),
         fc2_weight.stride(0), fc2_weight.stride(1),
         base_logits.stride(0), base_logits.stride(1),
         out_val.stride(0), out_val.stride(1),
         out_idx.stride(0), out_idx.stride(1),
+        BLOCK_B=block_b,
         BLOCK_V=block_v,
         BLOCK_M=block_m,
         HAS_FC2_BIAS=has_fc2_bias,
@@ -330,7 +361,7 @@ def fused_silu_fc2_argmax_with_value(
     out_idx: torch.Tensor,       # [B, num_v_blocks] int32 scratch
     final_token: torch.Tensor,   # [B] int64 destination, local vocab ids
     final_value: torch.Tensor,   # [B] fp32 destination, local max values
-    block_v: int = 512,
+    block_v: int = 128,
     block_m: int = 32,
     num_warps: int = 4,
     num_stages: int = 3,
@@ -339,22 +370,24 @@ def fused_silu_fc2_argmax_with_value(
     B, M = z_proj.shape
     V = base_logits.shape[1]
     num_v_blocks = (V + block_v - 1) // block_v
+    block_b = _score_block_b(B)
     has_fc2_bias = fc2_bias is not None
     fc2_bias_arg = fc2_bias if has_fc2_bias else out_val
 
     # dim0 必须是批维，见 kernel 内的 L2 复用说明。
-    grid_main = (B, num_v_blocks)
+    grid_main = ((B + block_b - 1) // block_b, num_v_blocks)
     _domino_fused_silu_fc2_argmax_kernel[grid_main](
         z_proj, s_proj,
         fc2_weight, base_logits, fc2_bias_arg,
         out_val, out_idx,
-        M, V,
+        B, M, V,
         z_proj.stride(0), z_proj.stride(1),
         s_proj.stride(0), s_proj.stride(1),
         fc2_weight.stride(0), fc2_weight.stride(1),
         base_logits.stride(0), base_logits.stride(1),
         out_val.stride(0), out_val.stride(1),
         out_idx.stride(0), out_idx.stride(1),
+        BLOCK_B=block_b,
         BLOCK_V=block_v,
         BLOCK_M=block_m,
         HAS_FC2_BIAS=has_fc2_bias,
