@@ -51,8 +51,11 @@ def _dspark_fused_markov_bias_argmax_kernel(
     FROM_TABLE: tl.constexpr,
 ):
     """Pass 1: per-tile matmul + base_logits + local argmax."""
-    pid_v = tl.program_id(0)
-    pid_b = tl.program_id(1)
+    # 批维放在 grid 的最快变化轴上：相邻 CTA 共享同一个 v 分块，fc2 的
+    # [BLOCK_V, R] 切片只需从 HBM 读一次，其余批次由 L2 命中。反过来
+    # （v 维在最快轴）会让整张 fc2 被重读 B 次，draft 时延随并发线性上升。
+    pid_b = tl.program_id(0)
+    pid_v = tl.program_id(1)
 
     offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
     mask_v = offs_v < V
@@ -292,7 +295,8 @@ def fused_markov_bias_argmax(
         latent_stride_r = latent.stride(1)
         prev_stride_b = 0
 
-    grid_main = (num_v_blocks, B)
+    # dim0 必须是批维，见 kernel 内的 L2 复用说明。
+    grid_main = (B, num_v_blocks)
     _dspark_fused_markov_bias_argmax_kernel[grid_main](
         embed_table, prev_tokens, latent_arg,
         fc2_weight, base_logits,

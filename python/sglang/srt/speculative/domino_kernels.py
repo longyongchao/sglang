@@ -38,8 +38,11 @@ def _domino_fused_silu_fc2_argmax_kernel(
     BLOCK_M: tl.constexpr,
     HAS_FC2_BIAS: tl.constexpr,
 ):
-    pid_v = tl.program_id(0)
-    pid_b = tl.program_id(1)
+    # 批维放在 grid 的最快变化轴上：相邻 CTA 共享同一个 v 分块，因此
+    # fc2 的 [BLOCK_V, M] 切片只需从 HBM 读一次，其余批次由 L2 命中。
+    # 若把 v 维放在最快轴上，fc2 会被整表重读 B 次（78 MiB × B × 15 步）。
+    pid_b = tl.program_id(0)
+    pid_v = tl.program_id(1)
 
     offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
     mask_v = offs_v < V
@@ -286,7 +289,8 @@ def fused_silu_fc2_argmax(
     has_fc2_bias = fc2_bias is not None
     fc2_bias_arg = fc2_bias if has_fc2_bias else out_val  # placeholder ptr
 
-    grid_main = (num_v_blocks, B)
+    # dim0 必须是批维，见 kernel 内的 L2 复用说明。
+    grid_main = (B, num_v_blocks)
     _domino_fused_silu_fc2_argmax_kernel[grid_main](
         z_proj, s_proj,
         fc2_weight, base_logits, fc2_bias_arg,
@@ -338,7 +342,8 @@ def fused_silu_fc2_argmax_with_value(
     has_fc2_bias = fc2_bias is not None
     fc2_bias_arg = fc2_bias if has_fc2_bias else out_val
 
-    grid_main = (num_v_blocks, B)
+    # dim0 必须是批维，见 kernel 内的 L2 复用说明。
+    grid_main = (B, num_v_blocks)
     _domino_fused_silu_fc2_argmax_kernel[grid_main](
         z_proj, s_proj,
         fc2_weight, base_logits, fc2_bias_arg,
