@@ -17,7 +17,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import accept_draft_
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _BUNDLED_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 _PLAIN_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash"
