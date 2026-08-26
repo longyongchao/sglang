@@ -115,6 +115,19 @@ _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 
 
+def _resolve_tree_mask_mode(target_attn_backend) -> TreeMaskMode:
+    """QLEN_ONLY when the target FlashInfer backend runs an optimized verify
+    attention mode ("prepacked" / "split" / "chain"): those consume the small
+    draft x draft tree block directly (or, for "chain", ignore it entirely
+    and plan causal attention), so the O(context)-sized FULL_MASK memset is
+    skipped. Every other backend (or a not-yet-created target backend) keeps
+    FULL_MASK."""
+    verify_attn_mode = getattr(target_attn_backend, "verify_attn_mode", None)
+    if verify_attn_mode is not None and verify_attn_mode.value != "legacy":
+        return TreeMaskMode.QLEN_ONLY
+    return TreeMaskMode.FULL_MASK
+
+
 def _get_plan_stream(
     device: str,
 ) -> Tuple[any, contextlib.AbstractContextManager]:
@@ -219,6 +232,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+        # Resolved for real in init_attention_backend(); the target worker's
+        # attention backend does not exist yet at construction time.
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
@@ -400,7 +415,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.tree_mask_mode = _resolve_tree_mask_mode(
+            self.target_worker.model_runner.attn_backend
+        )
 
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
@@ -594,6 +611,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
+            tree_mask_mode=self.tree_mask_mode,
             positions=position,
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,
@@ -1267,9 +1285,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         attn_backend = self._target_worker.model_runner.attn_backend
         mask_buf, position_buf = attn_backend.get_verify_buffers_to_fill_after_draft()
+        tree_mask_mode = (
+            _resolve_tree_mask_mode(attn_backend)
+            if mask_buf is None
+            else TreeMaskMode.FULL_MASK
+        )
         if mask_buf is not None:
             custom_mask = mask_buf
             custom_mask.fill_(True)
+        elif tree_mask_mode == TreeMaskMode.QLEN_ONLY:
+            # draft_token_num == 1: the tree block is one always-true bit/row.
+            custom_mask = torch.ones(bs, dtype=torch.bool, device=device)
         else:
             if batch.seq_lens_sum is not None:
                 seq_lens_sum = batch.seq_lens_sum
@@ -1288,6 +1314,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return EagleVerifyInput(
             draft_token=draft_input.bonus_tokens,
             custom_mask=custom_mask,
+            tree_mask_mode=tree_mask_mode,
             positions=positions,
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,

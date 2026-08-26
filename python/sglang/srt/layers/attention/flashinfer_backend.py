@@ -22,6 +22,12 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashinfer_tree_verify import (
+    FlashInferVerifyAttnMode,
+    compute_tree_verify_mask_byte_indptr,
+    pack_tree_verify_masks,
+    read_flashinfer_verify_attn_mode,
+)
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
@@ -38,6 +44,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -165,6 +172,9 @@ class PrefillMetadata:
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # "split" verify mode only: ragged wrapper running the draft x draft
+    # tree-mask attention whose output is merged with the prefix attention.
+    split_verify_ragged_wrapper: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -478,6 +488,112 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
+        # EAGLE target-verify attention mode (SGLANG_FLASHINFER_VERIFY_ATTN_MODE);
+        # resolved once with support-matrix fallbacks.
+        self.verify_attn_mode = self._resolve_verify_attn_mode(model_runner)
+        # "split" mode: captured bs -> planned-once draft-block ragged wrapper.
+        self.split_verify_ragged_metadata = {}
+        # "split" mode, eager path: a dedicated fa2 ragged wrapper. The shared
+        # extend wrapper may dispatch the fa3/SM90 module, which does not
+        # support custom masks.
+        self.prefill_wrapper_ragged_verify = None
+        if self.verify_attn_mode is FlashInferVerifyAttnMode.SPLIT:
+            self.prefill_wrapper_ragged_verify = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.workspace_buffer, "NHD", backend=self.prefill_backend
+                )
+            )
+
+    def _resolve_verify_attn_mode(
+        self, model_runner: ModelRunner
+    ) -> FlashInferVerifyAttnMode:
+        """Resolve SGLANG_FLASHINFER_VERIFY_ATTN_MODE with safety fallbacks.
+
+        The optimized modes ("prepacked" / "split") are wired for the EAGLE v2
+        worker family's target-verify path on the fa2 paged prefill backend
+        only. Anything outside that support matrix falls back to "legacy" with
+        a warning instead of failing at runtime.
+        """
+        mode = read_flashinfer_verify_attn_mode()
+        if self.skip_prefill or model_runner.is_draft_worker:
+            # Draft-side backends never run target verify; stay silent.
+            return FlashInferVerifyAttnMode.LEGACY
+
+        # topk=1: the draft tree degenerates to a chain, whose verify is plain
+        # causal attention -- strictly cheaper than any masked mode and
+        # bit-identical to legacy on fa2. Auto-select "chain" in that case,
+        # regardless of the env default or a "prepacked"/"split" setting.
+        # An *explicitly* pinned "legacy" is honored (baseline / debugging).
+        auto_chain = (
+            getattr(model_runner.server_args, "speculative_eagle_topk", None) == 1
+            and mode is not FlashInferVerifyAttnMode.CHAIN
+            and not (
+                mode is FlashInferVerifyAttnMode.LEGACY
+                and envs.SGLANG_FLASHINFER_VERIFY_ATTN_MODE.is_set()
+            )
+        )
+        if auto_chain:
+            mode = FlashInferVerifyAttnMode.CHAIN
+        if mode is FlashInferVerifyAttnMode.LEGACY:
+            return mode
+
+        spec_algorithm = model_runner.spec_algorithm
+        unsupported = None
+        if not spec_algorithm.is_eagle() or spec_algorithm.is_frozen_kv_mtp():
+            unsupported = f"speculative algorithm {spec_algorithm}"
+        elif self.dispatch_reason is not None:
+            unsupported = "sliding-window / cross-attention wrapper dispatch"
+        elif self.prefill_backend != "fa2":
+            unsupported = f"prefill backend {self.prefill_backend!r}"
+        elif self.is_multimodal or self.enable_mis or self.is_dllm_model:
+            unsupported = "multimodal / multi-item scoring / dllm models"
+        elif self.enable_deterministic:
+            unsupported = "deterministic inference"
+        elif getattr(
+            model_runner.server_args, "enable_two_batch_overlap", False
+        ):
+            unsupported = "two-batch overlap"
+        elif (
+            mode is FlashInferVerifyAttnMode.SPLIT
+            and model_runner.kv_cache_dtype != model_runner.dtype
+        ):
+            # The draft-block phase attends unquantized k/v; merging it with a
+            # quantized-KV prefix phase changes numerics vs. the legacy path.
+            unsupported = "quantized KV cache with split verify"
+        elif (
+            mode is FlashInferVerifyAttnMode.CHAIN
+            and model_runner.server_args.speculative_eagle_topk != 1
+        ):
+            # Chain verify replaces the tree mask with plain causal attention,
+            # which is only equivalent when the draft tree is a chain.
+            unsupported = (
+                "speculative_eagle_topk="
+                f"{model_runner.server_args.speculative_eagle_topk} "
+                "(chain verify requires topk=1)"
+            )
+        if unsupported is not None:
+            if auto_chain and not envs.SGLANG_FLASHINFER_VERIFY_ATTN_MODE.is_set():
+                # Auto-selection outside the support matrix is not an error
+                # the user needs to act on; fall back quietly.
+                logger.debug(
+                    "auto chain verify not supported with %s; using legacy.",
+                    unsupported,
+                )
+            else:
+                logger.warning(
+                    "SGLANG_FLASHINFER_VERIFY_ATTN_MODE=%s is not supported with "
+                    "%s; falling back to legacy verify attention.",
+                    mode.value,
+                    unsupported,
+                )
+            return FlashInferVerifyAttnMode.LEGACY
+        if auto_chain:
+            logger.info(
+                "speculative_eagle_topk=1: auto-selected chain verify "
+                "attention (mask-free causal paged prefill)."
+            )
+        return mode
+
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
         """Return the SWA KV pool to translate against, or None for non-SWA models.
@@ -722,10 +838,15 @@ class FlashInferAttnBackend(AttentionBackend):
             and getattr(spec_info, "num_tokens_per_req", None) is not None
             and spec_info.num_tokens_per_req > 0
             and getattr(spec_info, "ragged_verify_layout", None) is None
-            # Upstream plan() repacks custom masks on every replay. Until the
-            # fast path does the same, reusing its capture-time mask changes
-            # EAGLE tree attention semantics even when the mask shape is fixed.
-            and getattr(spec_info, "custom_mask", None) is None
+            # Upstream plan() repacks custom masks on every replay, so the
+            # legacy mode must keep the blocking plan(). The prepacked mode
+            # refreshes the packed mask itself with a Triton kernel, and the
+            # split mode runs the paged wrapper mask-free, so both can take
+            # the sync-free fast path.
+            and (
+                getattr(spec_info, "custom_mask", None) is None
+                or self.verify_attn_mode is not FlashInferVerifyAttnMode.LEGACY
+            )
             and seq_lens_cpu is not None
         )
         if (
@@ -803,6 +924,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 False,
                 False,
                 swa_out_cache_loc=swa_out_cache_loc,
+                split_verify_ragged_wrapper=(
+                    self.prefill_wrapper_ragged_verify
+                    if self.verify_attn_mode is FlashInferVerifyAttnMode.SPLIT
+                    and not forward_batch.forward_mode.is_idle()
+                    else None
+                ),
             )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -888,8 +1015,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices[i][0] = 0
 
         if not self.skip_prefill:
+            if self.verify_attn_mode is FlashInferVerifyAttnMode.LEGACY:
+                custom_mask_numel = max_num_tokens * self.max_context_len
+            elif self.verify_attn_mode is FlashInferVerifyAttnMode.CHAIN:
+                # Chain verify never binds a custom mask; keep a stub
+                # allocation so wrapper-construction code stays uniform.
+                custom_mask_numel = 8
+            else:
+                # Optimized verify modes fill this buffer bit-packed (8x
+                # smaller); + max_num_tokens covers the per-request byte
+                # rounding of the packed segments.
+                custom_mask_numel = (
+                    max_num_tokens * self.max_context_len
+                ) // 8 + max_num_tokens
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (custom_mask_numel,),
                 dtype=torch.uint8,
                 device="cuda",
             )
@@ -942,6 +1082,52 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         return wrappers
 
+    def _create_split_verify_ragged_wrapper(
+        self, bs: int, draft_token_num: int
+    ) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """Draft x draft tree-mask attention wrapper for "split" verify.
+
+        The qo/kv geometry is a constant per captured batch size, so the
+        wrapper is planned exactly once here (capture time). Replays only
+        rewrite the packed-mask buffer contents in place with the Triton pack
+        kernel; run() picks MaskMode.CUSTOM from the bound custom_mask_buf.
+        """
+        num_drafts = draft_token_num
+        seg_bytes = (num_drafts * num_drafts + 7) // 8
+        qo_indptr_buf = torch.arange(
+            0, (bs + 1) * num_drafts, num_drafts, dtype=torch.int32, device="cuda"
+        )
+        kv_indptr_buf = qo_indptr_buf.clone()
+        mask_indptr_buf = torch.arange(
+            0, (bs + 1) * seg_bytes, seg_bytes, dtype=torch.int32, device="cuda"
+        )
+        # Pre-fill all-visible: correct for the capture-time dummy input and
+        # for cuda-graph padding rows (their outputs are discarded but must
+        # stay finite).
+        custom_mask_buf = torch.full(
+            (bs * seg_bytes,), 0xFF, dtype=torch.uint8, device="cuda"
+        )
+        wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+            self.workspace_buffer,
+            "NHD",
+            use_cuda_graph=True,
+            backend=self.prefill_backend,
+            qo_indptr_buf=qo_indptr_buf,
+            kv_indptr_buf=kv_indptr_buf,
+            custom_mask_buf=custom_mask_buf,
+            mask_indptr_buf=mask_indptr_buf,
+        )
+        updater = self.indices_updater_prefill
+        wrapper.begin_forward(
+            qo_indptr_buf.clone(),
+            kv_indptr_buf.clone(),
+            updater.num_qo_heads,
+            updater.num_kv_heads,
+            updater.head_dim,
+            q_data_type=updater.q_data_type,
+        )
+        return wrapper
+
     def _prepare_cuda_graph_metadata(
         self,
         bs: int,
@@ -954,15 +1140,35 @@ class FlashInferAttnBackend(AttentionBackend):
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
+            split_verify = (
+                forward_mode.is_target_verify()
+                and self.verify_attn_mode is FlashInferVerifyAttnMode.SPLIT
+            )
             use_custom_mask = (
                 forward_mode.is_target_verify()
                 and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
+                # Split mode runs the paged wrapper mask-free over the prefix;
+                # the tree mask lives on the ragged draft-block wrapper.
+                # Chain mode (topk=1) is plain causal attention: no mask.
+                and not split_verify
+                and self.verify_attn_mode is not FlashInferVerifyAttnMode.CHAIN
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            split_verify_ragged_wrapper = None
+            if split_verify:
+                split_verify_ragged_wrapper = (
+                    self._create_split_verify_ragged_wrapper(
+                        bs, spec_info.draft_token_num
+                    )
+                )
+                self.split_verify_ragged_metadata[bs] = split_verify_ragged_wrapper
             self.forward_metadata = PrefillMetadata(
-                prefill_wrappers, forward_mode.is_dllm_extend(), False
+                prefill_wrappers,
+                forward_mode.is_dllm_extend(),
+                False,
+                split_verify_ragged_wrapper=split_verify_ragged_wrapper,
             )
         elif forward_mode.is_draft_extend_v2():
             # Draft-extend: causal paged prefill over the full sequence (no mask).
@@ -997,6 +1203,20 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
+        if (
+            self.forward_metadata.split_verify_ragged_wrapper is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            return self._forward_extend_split_verify(
+                q,
+                k,
+                v,
+                layer,
+                cache_loc,
+                logits_soft_cap,
+                prefill_wrapper_paged,
+                save_kv_cache,
+            )
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -1107,6 +1327,56 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer.v_scale,
                 )
 
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_extend_split_verify(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        cache_loc: torch.Tensor,
+        logits_soft_cap: float,
+        prefill_wrapper_paged: BatchPrefillWithPagedKVCacheWrapper,
+        save_kv_cache: bool,
+    ):
+        """Split verify: prefix attention (paged, mask-free) + draft-block
+        attention (ragged, small tree mask), merged with merge_state. The two
+        KV sets are disjoint, so the LSE-weighted merge reproduces the exact
+        softmax over [prefix union tree-visible drafts].
+        """
+        assert k is not None and v is not None
+        if save_kv_cache:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                k,
+                v,
+                layer.k_scale,
+                layer.v_scale,
+            )
+        # The paged wrapper's kv indices cover only the committed prefix, so
+        # the draft KV written above is invisible to this phase.
+        o_prefix, lse_prefix = prefill_wrapper_paged.forward_return_lse(
+            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            causal=False,
+            sm_scale=layer.scaling,
+            logits_soft_cap=logits_soft_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+        o_drafts, lse_drafts = (
+            self.forward_metadata.split_verify_ragged_wrapper.forward_return_lse(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+            )
+        )
+        o, _ = _safe_merge_state(o_prefix, lse_prefix, o_drafts, lse_drafts)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     @debug_kernel_api
@@ -1698,6 +1968,223 @@ class FlashInferIndicesUpdaterPrefill:
                 ),
             )
 
+    def _plan_eagle_verify_optimized(
+        self,
+        wrapper_paged: BatchPrefillWithPagedKVCacheWrapper,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        spec_info: SpecInput,
+        bs: int,
+    ) -> bool:
+        """Plan target-verify attention for the prepacked / split / chain modes.
+
+        Returns False to fall back to the legacy plan flow. That fallback is
+        intentional for capture-time dummy inputs under "prepacked": their
+        FULL_MASK bool mask must go through the real plan() once so it binds
+        the mask buffers and bakes MaskMode.CUSTOM into the captured kernels.
+        """
+        mode = self.attn_backend.verify_attn_mode
+        num_drafts = spec_info.draft_token_num
+        device = seq_lens.device
+        in_graph = any(
+            wrapper_paged is w
+            for w in self.attn_backend.prefill_cuda_graph_metadata.get(bs, ())
+        )
+        uses_fast_prefill = (
+            hasattr(wrapper_paged.begin_forward, "func")
+            and wrapper_paged.begin_forward.func is fast_prefill_plan
+        )
+        if mode is FlashInferVerifyAttnMode.PREPACKED and (
+            spec_info.tree_mask_mode != TreeMaskMode.QLEN_ONLY
+        ):
+            return False
+        if seq_lens_cpu is None:
+            # Rare eager corner: one blocking D2H, no worse than legacy plan().
+            seq_lens_cpu = seq_lens.cpu()
+        seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
+
+        paged_plan_kwargs = {}
+        causal = False
+        if mode is FlashInferVerifyAttnMode.CHAIN:
+            # topk=1: the draft chain occupies the KV slots right after the
+            # prefix, so verify is exactly causal attention over
+            # [prefix + drafts] with qo_len = draft_token_num. No mask is
+            # planned or bound; run() picks MaskMode.CAUSAL. The QLEN_ONLY
+            # draft x draft mask the worker still builds is ignored.
+            causal = True
+            kv_indices, kv_indptr, qo_indptr, _ = (
+                spec_info.generate_attn_arg_prefill(
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    paged_kernel_lens_sum,
+                    self.req_to_token,
+                )
+            )
+            if uses_fast_prefill:
+                kv_lens_cpu_i32 = seq_lens_cpu_i32 + num_drafts
+                kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
+                kv_indptr_host[1:] = torch.cumsum(kv_lens_cpu_i32, dim=0)
+                paged_plan_kwargs = dict(
+                    qo_indptr_host=torch.arange(
+                        0,
+                        (bs + 1) * num_drafts,
+                        step=num_drafts,
+                        dtype=torch.int32,
+                        device="cpu",
+                    ),
+                    kv_indptr_host=kv_indptr_host,
+                    kv_lens_host=kv_lens_cpu_i32,
+                    max_q_len=num_drafts,
+                    max_kv_len=int(seq_lens_cpu_i32.max()) + num_drafts,
+                )
+        elif mode is FlashInferVerifyAttnMode.PREPACKED:
+            kv_indices, kv_indptr, qo_indptr, tree_masks = (
+                spec_info.generate_attn_arg_prefill(
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    paged_kernel_lens_sum,
+                    self.req_to_token,
+                )
+            )
+            kv_lens_cpu_i32 = seq_lens_cpu_i32 + num_drafts
+            mask_byte_indptr_cpu = compute_tree_verify_mask_byte_indptr(
+                kv_lens_cpu_i32, num_drafts
+            )
+            max_kv_len = int(seq_lens_cpu_i32.max()) + num_drafts
+            max_seg_bytes = (max_kv_len * num_drafts + 7) // 8
+            if in_graph:
+                packed_mask_buf = wrapper_paged._custom_mask_buf
+                mask_byte_indptr = wrapper_paged._mask_indptr_buf
+                assert (
+                    packed_mask_buf is not None
+                    and int(mask_byte_indptr_cpu[-1]) <= packed_mask_buf.numel()
+                ), "cuda_graph_custom_mask too small for the packed verify mask"
+                mask_byte_indptr.copy_(mask_byte_indptr_cpu, non_blocking=True)
+            else:
+                packed_mask_buf = torch.empty(
+                    int(mask_byte_indptr_cpu[-1]), dtype=torch.uint8, device=device
+                )
+                mask_byte_indptr = mask_byte_indptr_cpu.to(device, non_blocking=True)
+            pack_tree_verify_masks(
+                tree_masks,
+                seq_lens,
+                mask_byte_indptr,
+                packed_mask_buf,
+                batch_size=bs,
+                draft_token_num=num_drafts,
+                max_seg_bytes=max_seg_bytes,
+            )
+            if uses_fast_prefill:
+                kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
+                kv_indptr_host[1:] = torch.cumsum(kv_lens_cpu_i32, dim=0)
+                paged_plan_kwargs = dict(
+                    qo_indptr_host=torch.arange(
+                        0,
+                        (bs + 1) * num_drafts,
+                        step=num_drafts,
+                        dtype=torch.int32,
+                        device="cpu",
+                    ),
+                    kv_indptr_host=kv_indptr_host,
+                    kv_lens_host=kv_lens_cpu_i32,
+                    max_q_len=num_drafts,
+                    max_kv_len=max_kv_len,
+                )
+        else:  # FlashInferVerifyAttnMode.SPLIT
+            kv_indices, kv_indptr, qo_indptr = (
+                spec_info.generate_attn_arg_prefill_prefix_only(
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    paged_kernel_lens_sum,
+                    self.req_to_token,
+                )
+            )
+            if uses_fast_prefill:
+                kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
+                kv_indptr_host[1:] = torch.cumsum(seq_lens_cpu_i32, dim=0)
+                paged_plan_kwargs = dict(
+                    qo_indptr_host=torch.arange(
+                        0,
+                        (bs + 1) * num_drafts,
+                        step=num_drafts,
+                        dtype=torch.int32,
+                        device="cpu",
+                    ),
+                    kv_indptr_host=kv_indptr_host,
+                    kv_lens_host=seq_lens_cpu_i32,
+                    max_q_len=num_drafts,
+                    max_kv_len=int(seq_lens_cpu_i32.max()),
+                )
+
+        wrapper_paged.begin_forward(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            self.kv_last_page_len[:bs],
+            self.num_qo_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            1,
+            q_data_type=self.q_data_type,
+            kv_data_type=self.data_type,
+            custom_mask=None,
+            causal=causal,
+            non_blocking=True,
+            **paged_plan_kwargs,
+        )
+
+        if mode is FlashInferVerifyAttnMode.CHAIN:
+            return True
+
+        if mode is FlashInferVerifyAttnMode.PREPACKED:
+            if not in_graph:
+                # Eager wrappers: attach the pre-packed mask after plan();
+                # run() selects MaskMode.CUSTOM from _custom_mask_buf.
+                wrapper_paged._custom_mask_buf = packed_mask_buf
+                wrapper_paged._mask_indptr_buf = mask_byte_indptr
+            return True
+
+        # SPLIT: plan / refresh the draft-block ragged phase.
+        if in_graph:
+            split_wrapper = self.attn_backend.split_verify_ragged_metadata[bs]
+            if spec_info.tree_mask_mode == TreeMaskMode.QLEN_ONLY:
+                pack_tree_verify_masks(
+                    spec_info.custom_mask,
+                    None,
+                    split_wrapper._mask_indptr_buf,
+                    split_wrapper._custom_mask_buf,
+                    batch_size=bs,
+                    draft_token_num=num_drafts,
+                    max_seg_bytes=(num_drafts * num_drafts + 7) // 8,
+                )
+            # else: capture-time dummy input; keep the all-visible pre-fill.
+        else:
+            if spec_info.tree_mask_mode != TreeMaskMode.QLEN_ONLY:
+                raise RuntimeError(
+                    "flashinfer split verify requires QLEN_ONLY tree masks, "
+                    "but the speculative worker produced a FULL_MASK layout"
+                )
+            qo_indptr_drafts = torch.arange(
+                0,
+                (bs + 1) * num_drafts,
+                num_drafts,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.attn_backend.prefill_wrapper_ragged_verify.begin_forward(
+                qo_indptr_drafts,
+                qo_indptr_drafts,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                custom_mask=spec_info.custom_mask,
+                q_data_type=self.q_data_type,
+            )
+        return True
+
     def call_begin_forward(
         self,
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
@@ -1719,6 +2206,23 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
+        if (
+            spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+            and self.attn_backend.verify_attn_mode
+            is not FlashInferVerifyAttnMode.LEGACY
+        ):
+            if self._plan_eagle_verify_optimized(
+                wrapper_paged,
+                req_pool_indices,
+                paged_kernel_lens,
+                paged_kernel_lens_sum,
+                seq_lens,
+                seq_lens_cpu,
+                spec_info,
+                bs,
+            ):
+                return
         if spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)

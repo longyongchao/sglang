@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
+from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,13 @@ class EagleVerifyInput(SpecInput):
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
+
+    # Layout of `custom_mask`: FULL_MASK covers the whole KV (prefix + draft
+    # tokens) as flat bools; QLEN_ONLY holds only the bs x draft_token_num x
+    # draft_token_num tree block (the prefix is implicitly all-visible).
+    # QLEN_ONLY is produced by the EAGLE v2 worker when the FlashInfer
+    # verify-attention mode is "prepacked" or "split".
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
@@ -138,7 +146,10 @@ class EagleVerifyInput(SpecInput):
             paged_kernel_lens_sum * self.draft_token_num
             + (self.draft_token_num**2) * batch_size
         )
-        if self.custom_mask.numel() < mask_numel:
+        if (
+            self.tree_mask_mode == TreeMaskMode.FULL_MASK
+            and self.custom_mask.numel() < mask_numel
+        ):
             # FIXME(attn): temporary fix for custom mask padding with cuda graph
             self.custom_mask = torch.cat(
                 [
@@ -154,6 +165,44 @@ class EagleVerifyInput(SpecInput):
             )
 
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
+
+    def generate_attn_arg_prefill_prefix_only(
+        self,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
+        req_to_token: torch.Tensor,
+    ):
+        """KV layout for the "split" verify mode's prefix phase: each request's
+        draft tokens attend only the committed prefix KV (no draft-token KV, no
+        mask). The draft-block attention runs separately on a ragged wrapper.
+        """
+        device = req_pool_indices.device
+        batch_size = len(req_pool_indices)
+        qo_indptr = torch.arange(
+            0,
+            (1 + batch_size) * self.draft_token_num,
+            step=self.draft_token_num,
+            dtype=torch.int32,
+            device=device,
+        )
+        cum_kv_seq_len = torch.zeros(
+            (batch_size + 1,), dtype=torch.int32, device=device
+        )
+        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum, dtype=torch.int32, device=device
+        )
+        create_flashinfer_kv_indices_triton[(batch_size,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            cum_kv_seq_len,
+            None,
+            kv_indices,
+            req_to_token.size(1),
+        )
+        return kv_indices, cum_kv_seq_len, qo_indptr
 
 
 @dataclass

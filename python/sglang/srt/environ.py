@@ -772,6 +772,24 @@ class Envs:
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+    # FlashInfer EAGLE target-verify attention mode (fa2 paged prefill only):
+    #   "legacy"    - bool FULL_MASK tree mask, repacked by FlashInfer plan()
+    #                 on every verify step (blocking D2H syncs inside plan).
+    #   "prepacked" - build the bit-packed mask directly on device with a
+    #                 Triton kernel and refresh cuda-graph plans sync-free
+    #                 via fast_prefill_plan.
+    #   "split"     - run verify as prefix attention (no mask) + draft-block
+    #                 attention (small tree mask), merged with merge_state;
+    #                 removes all O(context)-sized mask work.
+    #   "chain"     - topk=1 only: the draft chain is contiguous after the
+    #                 prefix, so verify runs as mask-free causal paged
+    #                 prefill (no tree mask exists on the verify path).
+    # Only wired for the EAGLE v2 worker family; other spec algorithms must
+    # keep the default.
+    # At speculative_eagle_topk=1, "chain" is auto-selected (it is strictly
+    # cheaper and bit-identical to legacy); explicitly setting "legacy"
+    # opts out for baseline / debugging runs.
+    SGLANG_FLASHINFER_VERIFY_ATTN_MODE = EnvStr("legacy")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
