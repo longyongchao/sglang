@@ -75,6 +75,7 @@ from sglang.srt.speculative.eagle_utils import (
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_pq_recorder import create_spec_pq_recorder
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
     draft_tp_context,
@@ -1134,6 +1135,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
             attn_tp_rank=get_parallel().attn_tp_rank,
         )
         self._draft_worker._observers = self._observers
+        self._pq_recorder = create_spec_pq_recorder(
+            tag="eagle", tp_rank=get_parallel().attn_tp_rank
+        )
+        if self._pq_recorder is not None and self.topk > 1:
+            logger.warning(
+                "SGLANG_SPEC_DUMP_PQ_PATH is set but speculative_eagle_topk=%d: "
+                "tree drafting has no single proposal distribution per slot, so "
+                "no p/q records will be written.",
+                self.topk,
+            )
+            self._pq_recorder = None
 
     @property
     def war_fastpath_runner(self):
@@ -1697,6 +1709,35 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 accept_index,
             ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
+
+        if self._pq_recorder is not None and not batch.forward_mode.is_idle():
+            num_slots = int(verify_input.draft_token_num)
+            candidates = verify_input.draft_token.reshape(bs, num_slots)
+            draft_probs = verify_input.draft_probs
+            self._pq_recorder.record_chain(
+                forward_ct=int(batch.forward_iter),
+                reqs=batch.reqs,
+                prefix_lens=batch.seq_lens,
+                draft_tokens=candidates[:, 1:],
+                # eagle_sample returns drafts + bonus; the recorder wants drafts.
+                num_correct_drafts=accept_lens - 1,
+                target_logits=logits_output.next_token_logits,
+                rows_per_request=num_slots,
+                target_temperatures=(
+                    batch.sampling_info.temperatures
+                    if batch.sampling_info is not None
+                    else None
+                ),
+                # draft_probs is None unless classic rejection sampling is on, in
+                # which case every other chain path drafts by argmax (q is a
+                # point mass).
+                draft_probs=draft_probs,
+                draft_temperature=(
+                    0.0
+                    if draft_probs is None
+                    else float(self.speculative_draft_temperature or 1.0)
+                ),
+            )
 
         # Update mamba state for hybrid GDN models after verification
         commit_mamba_states_after_verify(

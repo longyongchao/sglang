@@ -24,6 +24,7 @@ from sglang.srt.speculative.dspark_components.dspark_sts import StsDataRecorder
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.spec_pq_recorder import create_spec_pq_recorder
 
 logger = logging.getLogger(__name__)
 
@@ -842,6 +843,7 @@ class DsparkStepObservers:
             )
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
+        self._pq_recorder = create_spec_pq_recorder(tag="dspark", tp_rank=tp_rank)
 
     # --- step lifecycle -------------------------------------------------
 
@@ -959,6 +961,31 @@ class DsparkStepObservers:
                 bonus=bonus,
                 prefix_lens=prefix_lens,
                 layout=layout,
+            )
+        if self._pq_recorder is not None and target_logits is not None:
+            # Greedy rows draft by argmax, so their q is a point mass; report
+            # temperature 0 for them instead of the clamped 1e-5 placeholder.
+            draft_temps = draft_block.temperatures.reshape(-1).to(torch.float32)
+            draft_temps = torch.where(
+                draft_block.greedy_mask.reshape(-1),
+                torch.zeros_like(draft_temps),
+                draft_temps,
+            )
+            self._pq_recorder.record_chain(
+                forward_ct=forward_ct,
+                reqs=reqs,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+                num_correct_drafts=correct_len,
+                target_logits=target_logits,
+                rows_per_request=self._gamma + 1,
+                target_temperatures=(
+                    sampling_info.temperatures
+                    if sampling_info is not None
+                    else draft_block.temperatures
+                ),
+                draft_logits=draft_block.corrected_logits,
+                draft_temperatures=draft_temps,
             )
         if self._info_dumper.enabled:
             budget_decision = planner.take_budget_decision()

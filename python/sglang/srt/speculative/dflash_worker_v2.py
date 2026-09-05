@@ -43,6 +43,7 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_pq_recorder import create_spec_pq_recorder
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
@@ -289,6 +290,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             device=self.device,
             block_size=self.block_size,
             attn_tp_rank=get_parallel().attn_tp_rank,
+        )
+        self._pq_recorder = create_spec_pq_recorder(
+            tag="dflash", tp_rank=get_parallel().attn_tp_rank
         )
 
     @property
@@ -1943,6 +1947,32 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         self._observers.close_segment("target_verify")
+
+        if self._pq_recorder is not None:
+            num_draft = int(self.block_size) - 1
+            # draft_logits is None exactly when the drafter fell back to argmax,
+            # in which case q is a point mass (draft temperature reported as 0).
+            self._pq_recorder.record_chain(
+                forward_ct=int(batch.forward_iter),
+                reqs=batch.reqs,
+                prefix_lens=batch.seq_lens,
+                draft_tokens=candidates[:, 1:],
+                num_correct_drafts=accept_len,
+                target_logits=logits_output.next_token_logits,
+                rows_per_request=int(self.block_size),
+                target_temperatures=(
+                    sampling_info.temperatures if sampling_info is not None else None
+                ),
+                draft_logits=(
+                    None if draft_logits is None else draft_logits[:, :num_draft]
+                ),
+                draft_temperature=(
+                    0.0
+                    if draft_logits is None or draft_temp is None
+                    else float(draft_temp)
+                ),
+                draft_vocab_start=self._draft_vocab_start,
+            )
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
