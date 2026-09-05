@@ -3846,6 +3846,7 @@ class Scheduler(
         args_allow_update = set(
             [
                 "pp_max_micro_batch_size",
+                "random_seed",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
@@ -3869,6 +3870,13 @@ class Scheduler(
                 )
                 if_success = False
                 break
+            elif k == "random_seed":
+                try:
+                    int(v)
+                except (TypeError, ValueError):
+                    logging.warning(f"Updating {k} to {v} is rejected: not an integer.")
+                    if_success = False
+                    break
             elif k == "dspark_force_budget_frac":
                 if not self.spec_algorithm.is_dspark() or not hasattr(
                     self.draft_worker, "set_dspark_forced_budget_frac"
@@ -3935,6 +3943,11 @@ class Scheduler(
                 )
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
+            if "random_seed" in remaining:
+                # Re-seed the RNG in place. Overriding the server arg alone would
+                # only change what /get_server_info reports, and benchmarks need
+                # every repeated measurement to start from a known RNG state.
+                set_random_seed(int(remaining["random_seed"]))
             if remaining:
                 get_server_args().override(source="update_server_args", **remaining)
             logger.info(f"Global server args updated! {get_server_args()=}")
