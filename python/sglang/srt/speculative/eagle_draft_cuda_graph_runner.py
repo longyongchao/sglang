@@ -181,7 +181,18 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             draft_probs = (
                 torch.zeros(
-                    (self.max_bs, self.model_runner.model_config.vocab_size),
+                    # q is carried in the draft vocabulary; the worker scatters it
+                    # into the target vocabulary at the verify boundary. Must stay
+                    # in lockstep with EagleDraftWorker.q_vocab_size or the replay
+                    # copy_ below fails on shape.
+                    (
+                        self.max_bs,
+                        getattr(
+                            self.eagle_worker,
+                            "q_vocab_size",
+                            self.model_runner.model_config.vocab_size,
+                        ),
+                    ),
                     dtype=torch.float32,
                 )
                 if getattr(

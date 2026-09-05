@@ -85,10 +85,13 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
     renorm_draft_probs,
+    resolve_rejection_sampling_mode,
+    scatter_draft_probs_to_target_vocab,
     select_top_k_tokens,
     spec_stage_span,
 )
 from sglang.srt.utils.async_probe import (
+    maybe_assert_async,
     maybe_detect_inf,
     maybe_detect_nan,
     maybe_detect_oob,
@@ -174,13 +177,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.use_eagle3_rejection_sampling = (
-            server_args.speculative_use_rejection_sampling
-            and self.speculative_algorithm.is_eagle3()
-        )
-        self.use_classic_rejection_sampling = (
-            server_args.speculative_use_rejection_sampling
-            and not self.use_eagle3_rejection_sampling
+        self.use_eagle3_rejection_sampling, self.use_classic_rejection_sampling = (
+            resolve_rejection_sampling_mode(
+                use_rejection_sampling=server_args.speculative_use_rejection_sampling,
+                is_eagle3=self.speculative_algorithm.is_eagle3(),
+                topk=self.topk,
+                draft_temperature=self.speculative_draft_temperature,
+            )
         )
 
         # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
@@ -256,26 +259,37 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_lm_head()
         self._validate_hot_token_id()
 
-        if self.use_eagle3_rejection_sampling and self.hot_token_id is None:
-            _, draft_head = self.draft_runner.model.get_embed_and_head()
-            draft_vocab_size = draft_head.shape[0]
-            target_vocab_size = self.target_worker.model_config.vocab_size
-            if draft_vocab_size != target_vocab_size:
-                raise ValueError(
-                    "Official EAGLE3 rejection sampling requires a d2t token map "
-                    "when the draft head vocabulary is reduced."
-                )
-        if self.use_classic_rejection_sampling:
-            target_vocab_size = self.target_worker.model_config.vocab_size
-            draft_vocab_size = (
-                self.hot_token_id.shape[0]
-                if self.hot_token_id is not None
-                else target_vocab_size
+        _, draft_head = self.draft_runner.model.get_embed_and_head()
+        draft_vocab_size = draft_head.shape[0]
+        self.target_vocab_size = self.target_worker.model_config.vocab_size
+        if (
+            self.use_eagle3_rejection_sampling
+            and self.hot_token_id is None
+            and draft_vocab_size != self.target_vocab_size
+        ):
+            raise ValueError(
+                "Official EAGLE3 rejection sampling requires a d2t token map "
+                "when the draft head vocabulary is reduced."
             )
-            if draft_vocab_size != target_vocab_size:
-                raise ValueError(
-                    "Classic rejection sampling requires equal draft and target vocabularies."
-                )
+        if (
+            self.use_classic_rejection_sampling
+            and self.hot_token_id is None
+            and draft_vocab_size != self.target_vocab_size
+        ):
+            raise ValueError(
+                "Classic rejection sampling requires equal draft and target "
+                "vocabularies, or a d2t token map to lift the draft proposal "
+                "distribution into the target vocabulary."
+            )
+        # q is carried in the draft vocabulary and only scattered into the target
+        # vocabulary at the verify-kernel boundary (see
+        # _build_verify_draft_probs), so every q-shaped buffer -- including the
+        # draft cuda-graph buffer and the overlap FutureMap -- is draft-wide.
+        self.q_vocab_size = (
+            draft_vocab_size
+            if self.hot_token_id is not None
+            else self.target_vocab_size
+        )
 
     def init_attention_backends(self):
         with self.draft_tp_context(
@@ -767,7 +781,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
             draft_probs = (
-                torch.stack(draft_probs_list, dim=1)
+                self._build_verify_draft_probs(draft_probs_list, draft_tokens)
                 if self.use_classic_rejection_sampling
                 else None
             )
@@ -778,11 +792,49 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         draft_probs = (
-            torch.stack(draft_probs_list, dim=1)
+            self._build_verify_draft_probs(draft_probs_list, draft_tokens)
             if self.use_classic_rejection_sampling
             else None
         )
         return parent_list, top_scores_index, draft_tokens, draft_probs
+
+    def _build_verify_draft_probs(
+        self, draft_probs_list: List[torch.Tensor], draft_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """Stack the per-step q into the (bs, num_steps, vocab) verify input.
+
+        Row i of the result is the proposal distribution the draft token at chain
+        slot i + 1 was sampled from; the chain kernel reads row `step - 1` when
+        verifying slot `step`, so the list order must not be disturbed.
+
+        The chain kernel indexes q by target token id, so a reduced draft
+        vocabulary is scattered into the target vocabulary here -- once, at the
+        kernel boundary, instead of on every producer.
+        """
+        if self.topk != 1:
+            raise ValueError(
+                "Classic chain rejection sampling requires speculative_eagle_topk=1; "
+                f"got {self.topk}. The tree topology has no single q per slot."
+            )
+        draft_probs = torch.stack(draft_probs_list, dim=1)
+        if self.hot_token_id is not None:
+            draft_probs = scatter_draft_probs_to_target_vocab(
+                draft_probs, self.hot_token_id, self.target_vocab_size
+            )
+        # Every proposed token was drawn from its own row of q, so q > 0 there.
+        # A misaligned or mis-scattered q shows up as q == 0, which makes
+        # `coin * q < p` vacuously true: accept length pins to num_steps while
+        # the text degrades. Gated so the gather never runs in production.
+        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            proposed_q = draft_probs.gather(
+                -1, draft_tokens.to(torch.int64).unsqueeze(-1)
+            )
+            maybe_assert_async(
+                (proposed_q > 0).all(),
+                "draft_forward: q == 0 on a proposed draft token; draft_probs rows "
+                "are misaligned with the chain slots or the d2t scatter is wrong",
+            )
+        return draft_probs
 
     def draft_extend(self):
         pass
@@ -1217,7 +1269,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     dtype=EagleDraftInput.dtype_for(self.draft_worker),
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
-                    vocab_size=self.target_worker.model_config.vocab_size,
+                    # Width must match the draft worker's q carrier, not the
+                    # target vocabulary: the idle stub is copy_'d into the draft
+                    # cuda-graph buffer.
+                    vocab_size=self.draft_worker.q_vocab_size,
                 )
             if self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still

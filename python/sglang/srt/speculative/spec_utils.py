@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -100,9 +100,12 @@ def renorm_draft_probs(
     """Draft-side next-token distribution.
 
     ``draft_temperature=None`` inherits the request temperature when rejection
-    sampling is enabled. A positive override uses that temperature. Zero means
-    deterministic drafting: token selection remains top-k/argmax, while
-    ``softmax(logits)`` supplies stable scores for ranking a multi-branch tree.
+    sampling is enabled. A positive override uses that temperature. Zero does
+    *not* produce a one-hot distribution: token selection becomes top-k/argmax,
+    while the returned scores stay ``softmax(logits)`` (temperature 1) so a
+    multi-branch tree still has stable ranking scores. A ``q`` obtained this way
+    therefore does not match the distribution the token was drawn from, and must
+    not be fed to the ``coin * q < p`` accept test.
     """
     if not next_token_logits.size(0):
         return torch.softmax(next_token_logits, dim=-1)
@@ -127,16 +130,67 @@ def renorm_draft_probs(
     return torch.softmax(next_token_logits / temperatures, dim=-1)
 
 
-def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
-    """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
+def resolve_rejection_sampling_mode(
+    *,
+    use_rejection_sampling: bool,
+    is_eagle3: bool,
+    topk: int,
+    draft_temperature: Optional[float],
+) -> Tuple[bool, bool]:
+    """Pick the verify kernel for rejection sampling: ``(official, classic)``.
 
-    Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
-    only if q is exactly the distribution X was drawn from, so callers must hand
-    the returned q (not a recomputed one) to the verify.
+    ``official`` is EAGLE3's target-only tree kernel, which is unbiased w.r.t.
+    ``p`` but never reads ``q`` -- so the draft temperature has no observable
+    effect there. ``classic`` is the Leviathan chain (``min(1, p/q)`` accept,
+    ``relu(p-q)`` residual), which needs a real ``q``.
+
+    EAGLE3 only earns the classic path when the draft tree is a chain
+    (``topk == 1``) and the draft temperature is a positive override:
+    ``renorm_draft_probs(draft_temperature=0)`` returns ``softmax(logits)`` while
+    the token is picked by argmax, so that ``q`` is not the proposal
+    distribution and would bias the accept test. Both flags false means no
+    rejection sampling at all.
+
+    Shared by the draft worker and the server-arg hook; both must agree on the
+    mode, so neither may re-derive it locally.
     """
-    probs = torch.softmax(next_token_logits / temperatures, dim=-1)
-    topk_p, topk_index = fast_sample(probs, num_samples=1)
-    return probs, topk_p, topk_index
+    if not use_rejection_sampling:
+        return False, False
+    if not is_eagle3:
+        return False, True
+    if (draft_temperature is not None and draft_temperature > 0) and topk == 1:
+        return False, True
+    return True, False
+
+
+def scatter_draft_probs_to_target_vocab(
+    draft_probs: torch.Tensor,
+    hot_token_id: torch.Tensor,
+    target_vocab_size: int,
+) -> torch.Tensor:
+    """Lift a reduced-vocabulary ``q`` into the target vocabulary.
+
+    EAGLE3 draft heads emit ``draft_vocab_size`` logits and ``hot_token_id``
+    maps those columns onto target token ids. This is exact, not an
+    approximation: the draft can only ever propose a hot token, so ``q(x) = 0``
+    on every non-hot ``x`` is the true proposal mass. The accept test therefore
+    never sees ``q = 0`` on a proposed token, and ``relu(p - q)`` keeps the full
+    ``p`` on non-hot tokens.
+
+    fp32 is forced so the eager and CUDA-graph paths hand the kernel the same
+    dtype. No buffer reuse: the returned tensor outlives this call under overlap
+    scheduling, so a cached buffer would alias across iterations.
+    """
+    out = torch.zeros(
+        (*draft_probs.shape[:-1], target_vocab_size),
+        dtype=torch.float32,
+        device=draft_probs.device,
+    )
+    # index_copy_ (not advanced indexing / scatter_): advanced indexing lowers to
+    # a non-deterministic index_put_ on duplicate indices, and scatter_ would
+    # need an index tensor of the full source shape.
+    out.index_copy_(-1, hot_token_id, draft_probs.to(torch.float32))
+    return out
 
 
 # Simulate acceptance length for benchmarking purposes

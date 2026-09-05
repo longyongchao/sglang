@@ -588,23 +588,47 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     if server_args.speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
-        # EAGLE3 verifies target-space tree proposals without draft q; classic
-        # EAGLE supplies an equal-vocabulary q distribution to the chain kernel.
+        # Two verify kernels: the classic Leviathan chain, which needs the draft
+        # proposal distribution q, and EAGLE3's target-only tree, which does not.
         if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
             raise NotImplementedError(
                 "--speculative-use-rejection-sampling is only supported for "
                 "EAGLE / EAGLE3 / NEXTN, not "
                 f"speculative_algorithm={server_args.speculative_algorithm}."
             )
-        # EAGLE3 uses official target-only tree rejection at every top-k;
-        # classic EAGLE actual-q rejection remains a linear chain.
-        if (
-            server_args.speculative_algorithm == "EAGLE"
-            and server_args.speculative_eagle_topk != 1
-        ):
+        # Same resolver the draft worker uses, so the mode cannot drift between
+        # startup validation and the verify kernel that actually runs.
+        from sglang.srt.speculative.spec_utils import resolve_rejection_sampling_mode
+
+        is_eagle3 = server_args.speculative_algorithm == "EAGLE3"
+        use_official, use_classic = resolve_rejection_sampling_mode(
+            use_rejection_sampling=True,
+            is_eagle3=is_eagle3,
+            topk=server_args.speculative_eagle_topk,
+            draft_temperature=server_args.speculative_draft_temperature,
+        )
+        # The classic kernel reads one q per chain slot, which a tree does not have.
+        if use_classic and server_args.speculative_eagle_topk != 1:
             raise ValueError(
-                "Classic EAGLE rejection sampling requires --speculative-eagle-topk=1; "
-                "EAGLE3 supports full-tree rejection sampling for topk>1."
+                "Classic rejection sampling requires --speculative-eagle-topk=1, got "
+                f"{server_args.speculative_eagle_topk}. Drop "
+                "--speculative-draft-temperature to fall back to EAGLE3 target-only "
+                "tree rejection sampling."
+            )
+        # Official EAGLE3 rejection never reads the draft distribution, so the draft
+        # temperature is unobservable in the accept decision.
+        if (
+            use_official
+            and server_args.speculative_draft_temperature is not None
+            and server_args.speculative_draft_temperature > 0
+        ):
+            logger.warning(
+                "--speculative-draft-temperature=%s is ignored: EAGLE3 with "
+                "--speculative-eagle-topk=%s uses target-only tree rejection "
+                "sampling, which does not read the draft proposal distribution. "
+                "Use --speculative-eagle-topk 1 for the classic min(1, p/q) chain.",
+                server_args.speculative_draft_temperature,
+                server_args.speculative_eagle_topk,
             )
         if (
             server_args.speculative_accept_threshold_single != 1.0
@@ -636,7 +660,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             )
         logger.info(
             "Rejection sampling is enabled for speculative decoding "
-            "(speculative_use_rejection_sampling=True)."
+            "(speculative_use_rejection_sampling=True, mode=%s).",
+            "classic-chain" if use_classic else "eagle3-official-tree",
         )
 
     if (
