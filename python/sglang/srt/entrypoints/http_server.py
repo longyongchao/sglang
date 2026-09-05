@@ -28,6 +28,7 @@ import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
+    Annotated,
     Any,
     AsyncGenerator,
     AsyncIterator,
@@ -35,6 +36,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    TypeVar,
     Union,
 )
 
@@ -43,6 +45,7 @@ import requests
 import uvicorn
 import uvloop
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     File,
@@ -181,6 +184,17 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
+
+_T = TypeVar("_T")
+
+# FastAPI only auto-binds a parameter to the request body when its type is a
+# pydantic BaseModel (or another type it classifies as "complex"). The io_struct
+# request types are msgspec.Struct, which FastAPI classifies as a scalar and
+# therefore reads from the *query string*: the JSON body is ignored and the call
+# fails with "Field required" on the missing query param (remapped to 400 by
+# validation_exception_handler below). Annotate such parameters as
+# ``JsonBody[SomeReqInput]`` so they bind to the body.
+JsonBody = Annotated[_T, Body()]
 
 
 # Store global states
@@ -739,7 +753,7 @@ async def get_load():
 # curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def set_internal_state(obj: SetInternalStateReq, request: Request):
+async def set_internal_state(obj: JsonBody[SetInternalStateReq], request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
 
@@ -950,7 +964,7 @@ async def clear_hicache_storage_backend():
 #   }'
 @app.api_route("/hicache/storage-backend", methods=["PUT"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
+async def attach_hicache_storage_backend(obj: JsonBody[AttachHiCacheStorageReqInput]):
     """Attach (enable) HiCache storage backend at runtime.
 
     Only allowed when there are NO running / queued requests.
@@ -1105,7 +1119,9 @@ async def dump_expert_distribution_record_async():
 
 @app.post("/update_weights_from_disk")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
+async def update_weights_from_disk(
+    obj: JsonBody[UpdateWeightFromDiskReqInput], request: Request
+):
     """Update the weights from disk inplace without re-launching the server."""
     (
         success,
@@ -1133,7 +1149,7 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
 @app.post("/init_weights_send_group_for_remote_instance")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_send_group_for_remote_instance(
-    obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
+    obj: JsonBody[InitWeightsSendGroupForRemoteInstanceReqInput], request: Request
 ):
     (
         success,
@@ -1151,7 +1167,7 @@ async def init_weights_send_group_for_remote_instance(
 @app.post("/send_weights_to_remote_instance")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def send_weights_to_remote_instance(
-    obj: SendWeightsToRemoteInstanceReqInput, request: Request
+    obj: JsonBody[SendWeightsToRemoteInstanceReqInput], request: Request
 ):
     (
         success,
@@ -1207,7 +1223,7 @@ async def remote_instance_transfer_engine_info(rank: int = None):
 @app.post("/init_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_update_group(
-    obj: InitWeightsUpdateGroupReqInput, request: Request
+    obj: JsonBody[InitWeightsUpdateGroupReqInput], request: Request
 ):
     """Initialize the parameter update group."""
     success, message = await _global_state.tokenizer_manager.init_weights_update_group(
@@ -1223,7 +1239,7 @@ async def init_weights_update_group(
 @app.post("/destroy_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def destroy_weights_update_group(
-    obj: DestroyWeightsUpdateGroupReqInput, request: Request
+    obj: JsonBody[DestroyWeightsUpdateGroupReqInput], request: Request
 ):
     """Destroy the parameter update group."""
     (
@@ -1239,7 +1255,7 @@ async def destroy_weights_update_group(
 @app.post("/update_weights_from_tensor")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_tensor(
-    obj: UpdateWeightsFromTensorReqInput, request: Request
+    obj: JsonBody[UpdateWeightsFromTensorReqInput], request: Request
 ):
     """Update the weights from tensor inplace without re-launching the server.
     Notes:
@@ -1261,7 +1277,7 @@ async def update_weights_from_tensor(
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
-    obj: UpdateWeightsFromDistributedReqInput, request: Request
+    obj: JsonBody[UpdateWeightsFromDistributedReqInput], request: Request
 ):
     """Update model parameter from distributed online."""
     (
@@ -1280,7 +1296,9 @@ async def update_weights_from_distributed(
 
 @app.post("/update_weights_from_ipc")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
+async def update_weights_from_ipc(
+    obj: JsonBody[UpdateWeightsFromIPCReqInput], request: Request
+):
     """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
     success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
         obj, request
@@ -1297,7 +1315,9 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
 
 @app.post("/update_weight_version")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
+async def update_weight_version(
+    obj: JsonBody[UpdateWeightVersionReqInput], request: Request
+):
     """Update the weight version. This operation requires no active requests."""
     if obj.abort_all_requests:
         _global_state.tokenizer_manager.abort_request(abort_all=True)
@@ -1328,7 +1348,9 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
+async def get_weights_by_name(
+    obj: JsonBody[GetWeightsByNameReqInput], request: Request
+):
     """Get model parameter by name."""
     try:
         ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
@@ -1343,7 +1365,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def release_memory_occupation(
-    obj: ReleaseMemoryOccupationReqInput, request: Request
+    obj: JsonBody[ReleaseMemoryOccupationReqInput], request: Request
 ):
     """Release GPU memory occupation temporarily."""
     try:
@@ -1355,7 +1377,7 @@ async def release_memory_occupation(
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def resume_memory_occupation(
-    obj: ResumeMemoryOccupationReqInput, request: Request
+    obj: JsonBody[ResumeMemoryOccupationReqInput], request: Request
 ):
     """Resume GPU memory occupation."""
     try:
@@ -1384,7 +1406,7 @@ async def check_weights(
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def slow_down(obj: SlowDownReqInput, request: Request):
+async def slow_down(obj: JsonBody[SlowDownReqInput], request: Request):
     """Slow down the system deliberately. Only for testing. Example scenario:
     when we want to test performance of D in large-scale PD disaggregation and have no enough nodes for P,
     we can use this to slow down D to let it have enough running sequences, and then disable slowdown
@@ -1398,7 +1420,7 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
 
 @app.api_route("/load_lora_adapter", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
+async def load_lora_adapter(obj: JsonBody[LoadLoRAAdapterReqInput], request: Request):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
 
@@ -1416,7 +1438,7 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
 async def load_lora_adapter_from_tensors(
-    obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
+    obj: JsonBody[LoadLoRAAdapterFromTensorsReqInput], request: Request
 ):
     """Load a new LoRA adapter from tensors without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
@@ -1431,7 +1453,9 @@ async def load_lora_adapter_from_tensors(
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
+async def unload_lora_adapter(
+    obj: JsonBody[UnloadLoRAAdapterReqInput], request: Request
+):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
 
@@ -1448,7 +1472,7 @@ async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])
-async def open_session(obj: OpenSessionReqInput, request: Request):
+async def open_session(obj: JsonBody[OpenSessionReqInput], request: Request):
     """Open a session, and return its unique session id."""
     try:
         session_id = await _global_state.tokenizer_manager.open_session(obj, request)
@@ -1462,7 +1486,7 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
 
 
 @app.api_route("/close_session", methods=["GET", "POST"])
-async def close_session(obj: CloseSessionReqInput, request: Request):
+async def close_session(obj: JsonBody[CloseSessionReqInput], request: Request):
     """Close the session."""
     try:
         await _global_state.tokenizer_manager.close_session(obj, request)
@@ -1473,7 +1497,7 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def configure_logging(obj: ConfigureLoggingReq, request: Request):
+async def configure_logging(obj: JsonBody[ConfigureLoggingReq], request: Request):
     """Configure the request logging options."""
     _global_state.tokenizer_manager.configure_logging(obj)
     return Response(status_code=200)
@@ -1481,7 +1505,7 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 
 @app.post("/abort_request")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def abort_request(obj: AbortReq, request: Request):
+async def abort_request(obj: JsonBody[AbortReq], request: Request):
     """Abort a request."""
     try:
         _global_state.tokenizer_manager.abort_request(
@@ -1493,7 +1517,9 @@ async def abort_request(obj: AbortReq, request: Request):
 
 
 @app.post("/parse_function_call")
-async def parse_function_call_request(obj: ParseFunctionCallReq, request: Request):
+async def parse_function_call_request(
+    obj: JsonBody[ParseFunctionCallReq], request: Request
+):
     """
     A native API endpoint to parse function calls from a text.
     """
@@ -1515,7 +1541,9 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
 
 
 @app.post("/separate_reasoning")
-async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Request):
+async def separate_reasoning_request(
+    obj: JsonBody[SeparateReasoningReqInput], request: Request
+):
     """
     A native API endpoint to separate reasoning from a text.
     """
@@ -1547,7 +1575,7 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 
 @app.post("/pause_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def pause_generation(obj: PauseGenerationReqInput, request: Request):
+async def pause_generation(obj: JsonBody[PauseGenerationReqInput], request: Request):
     """Pause generation."""
     await _global_state.tokenizer_manager.pause_generation(obj)
     return ORJSONResponse(
@@ -1558,7 +1586,9 @@ async def pause_generation(obj: PauseGenerationReqInput, request: Request):
 
 @app.post("/continue_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def continue_generation(obj: ContinueGenerationReqInput, request: Request):
+async def continue_generation(
+    obj: JsonBody[ContinueGenerationReqInput], request: Request
+):
     """Continue generation."""
     await _global_state.tokenizer_manager.continue_generation(obj)
     return ORJSONResponse(
@@ -1897,7 +1927,9 @@ async def sagemaker_chat_completions(
 
 ## Vertex AI API
 @app.post(os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate"))
-async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Request):
+async def vertex_generate(
+    vertex_req: JsonBody[VertexGenerateReqInput], raw_request: Request
+):
     if not vertex_req.instances:
         return []
     inputs = {}
