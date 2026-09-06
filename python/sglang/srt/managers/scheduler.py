@@ -559,6 +559,25 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
+        if server_args.enable_spec_capture:
+            # Capture needs single-pass prefill; chunking would drop all but the
+            # final chunk's hidden rows.
+            if server_args.chunked_prefill_size != -1:
+                raise ValueError(
+                    "--enable-spec-capture requires --chunked-prefill-size -1 "
+                    "(single-pass prefill) so captured hidden states cover the "
+                    "whole sequence"
+                )
+            if not server_args.disable_radix_cache:
+                raise ValueError(
+                    "--enable-spec-capture requires --disable-radix-cache: a "
+                    "prefix-cache hit skips prefilling (and capturing) the "
+                    "cached tokens, silently truncating the stored hidden states"
+                )
+            from sglang.srt import spec_capture_sink
+
+            spec_capture_sink.maybe_init_sink(server_args)
+
         self.is_initializing = False
 
     def init_zbal_on_npu(self):
@@ -2126,6 +2145,7 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                spec_capture=recv_req.spec_capture,
             )
             req.tokenizer = self.tokenizer
 

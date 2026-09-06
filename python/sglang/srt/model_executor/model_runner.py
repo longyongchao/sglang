@@ -534,6 +534,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.dflash_family_draft_num_layers = int(draft_num_layers)
             self.dflash_family_target_layer_ids = target_layer_ids
 
+        self.maybe_init_spec_capture_aux_layers()
+
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()
@@ -1042,6 +1044,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 device=self.device,
             )
         )
+
+    def maybe_init_spec_capture_aux_layers(self):
+        """Enable aux hidden state capture for `--enable-spec-capture` runs.
+
+        Spec capture harvests target-model features for offline draft training,
+        so there is no draft worker and `spec_algorithm` stays NONE. The layer
+        ids come straight from the CLI instead of a draft config, and the
+        capture method decides which model hook `init_aux_hidden_state_capture`
+        will dispatch to (VL wrappers only wire `layers_to_capture` through the
+        dflash path).
+        """
+        if not self.server_args.enable_spec_capture or self.is_draft_worker:
+            return
+
+        if self.server_args.spec_capture_method == "dflash":
+            self.dflash_family_use_aux_hidden_state = True
+            self.dflash_family_target_layer_ids = (
+                self.server_args.spec_capture_aux_layer_ids
+            )
+        else:
+            self.eagle_use_aux_hidden_state = True
+            self.eagle_aux_hidden_state_layer_ids = (
+                self.server_args.spec_capture_aux_layer_ids
+            )
 
     def init_aux_hidden_state_capture(self):
         """Configure auxiliary hidden state capture for speculative decoding.

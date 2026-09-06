@@ -1735,7 +1735,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 draft_temperature=(
                     0.0
                     if draft_probs is None
-                    else float(self.speculative_draft_temperature or 1.0)
+                    else float(self.server_args.speculative_draft_temperature or 1.0)
                 ),
             )
 

@@ -259,6 +259,18 @@ class SchedulerBatchResultProcessor:
                         )
 
                     if (
+                        req.spec_capture is not None
+                        and logits_output.hidden_states is not None
+                    ):
+                        # Spec-training capture: keep tensor slices, sink on finish.
+                        hidden_state_offset = self._append_spec_capture_states(
+                            req=req,
+                            logits_output=logits_output,
+                            hidden_state_offset=hidden_state_offset,
+                        )
+                        if req.finished():
+                            self._sink_spec_capture(req)
+                    elif (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
@@ -463,6 +475,62 @@ class SchedulerBatchResultProcessor:
                     f"{batch.contains_last_prefill_chunk}). "
                     f"Placeholder zeros would be appended to output_ids."
                 )
+
+    def _append_spec_capture_states(
+        self,
+        *,
+        req: Req,
+        logits_output: LogitsProcessorOutput,
+        hidden_state_offset: int,
+    ) -> int:
+        """Accumulate captured rows as CPU tensors for the Mooncake sink.
+
+        Same offset arithmetic as ``_append_prefill_hidden_states`` but keeps
+        tensor slices (aux concat in ``hidden_states``, post-norm last in
+        ``last_hidden_states``) rather than the JSON-able response payload.
+        """
+        start = hidden_state_offset
+        end = start + len(req.origin_input_ids)
+        req.spec_capture_aux.append(
+            logits_output.hidden_states[start:end].cpu().clone()
+        )
+        if logits_output.last_hidden_states is not None:
+            req.spec_capture_last_hidden.append(
+                logits_output.last_hidden_states[start:end].cpu().clone()
+            )
+        return end
+
+    def _sink_spec_capture(self, req: Req) -> None:
+        """Write a finished capture request's tensors to the Mooncake sink.
+
+        Runs on the attention-TP rank that streams output; the per-request result
+        (or an ``{"error": ...}`` marker) is set on ``req.spec_capture_result``,
+        returned to the client via the dedicated ``spec_capture`` output field
+        (a per-request channel, unlike per-token ``customized_info``).
+        """
+        from sglang.srt import spec_capture_sink
+
+        sink = spec_capture_sink.get_sink()
+        if sink is None or self.output_streamer.ps.attn_tp_rank != 0:
+            return
+        aux = torch.cat(req.spec_capture_aux, dim=0) if req.spec_capture_aux else None
+        last_hidden = (
+            torch.cat(req.spec_capture_last_hidden, dim=0)
+            if req.spec_capture_last_hidden
+            else None
+        )
+        try:
+            req.spec_capture_result = sink.put_sample(
+                req.spec_capture, aux=aux, last_hidden=last_hidden
+            )
+        except Exception as e:
+            logger.error("spec-capture sink failed for %s: %s", req.rid, e)
+            req.spec_capture_result = {
+                "sample_id": req.spec_capture.get("sample_id"),
+                "error": str(e),
+            }
+        req.spec_capture_aux = []
+        req.spec_capture_last_hidden = []
 
     def _append_prefill_hidden_states(
         self,
