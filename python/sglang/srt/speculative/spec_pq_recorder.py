@@ -10,12 +10,24 @@ Each record also carries diagnostics that are free to compute once the target
 row has been normalized: the drafted token's rank under the target ``rk``, the
 target's own argmax token ``ta`` and its log-prob ``lpa``, the target entropy
 ``ent`` (the position's intrinsic difficulty, independent of the drafter), and
-the drafted token's output-relative position ``pos``.
+the drafted token's output-relative position ``pos``. When ``bonus_tokens`` is
+provided, the final bonus token and its output position are attached to exactly
+one draft row per request; no bonus fields are emitted otherwise.
+
+``dent`` mirrors ``ent`` on the draft side: the entropy of the drafter's own
+belief, i.e. its logits at temperature 1 rather than at the sampling
+temperature. It is emitted only for rows whose draft temperature is non-zero,
+because a greedy drafter keeps no distribution to measure. Drafters with a
+truncated vocabulary report the entropy over the columns they actually own; the
+value is comparable to ``ent`` in scale but not over an identical support.
 
 Chain layout convention shared by EAGLE3 (topk==1), DFlash/DFlare/DPace/Domino
 and DSpark: for request ``b``, drafted token ``j`` (0-based) sits at candidate
 slot ``j + 1``, its target logits row is ``b * rows_per_request + j``, and it is
-accepted iff ``j < num_correct_drafts[b]``.
+accepted iff ``j < num_correct_drafts[b]``. The bonus owner is the frontier row
+``j == num_correct_drafts[b]`` for rejection, or the last draft row for full
+acceptance; ``bonus_pos`` records the bonus position after the final draft in
+the latter case.
 """
 
 from __future__ import annotations
@@ -37,6 +49,9 @@ logger = logging.getLogger(__name__)
 # rows, so keep the chunk small enough to stay well inside the KV-cache slack.
 _GATHER_CHUNK_ROWS = 128
 _FLUSH_EVERY_RECORDS = 4096
+# Floor for probabilities before taking a log; a truncated draft vocab leaves
+# exact zeros behind.
+_MIN_PROB = 1e-30
 
 
 class SpecPqRecord(msgspec.Struct, omit_defaults=True):
@@ -55,6 +70,11 @@ class SpecPqRecord(msgspec.Struct, omit_defaults=True):
     lq: Optional[float] = None  # log q_draft(tok); None when unavailable
     tt: float = 1.0  # target temperature used for lp (greedy reported as 1.0)
     dt: float = 0.0  # draft temperature; 0.0 means the drafter was greedy
+    # entropy of the drafter's T=1 belief at this position, in nats; None when
+    # the drafter was greedy or kept no distribution
+    dent: Optional[float] = None
+    bonus_token: Optional[int] = None  # final bonus token emitted after drafts
+    bonus_pos: Optional[int] = None  # output position of the bonus token
 
 
 def spec_dump_pq_path() -> str:
@@ -91,6 +111,40 @@ def gather_row_logprobs(
         chunks.append(
             logprobs.gather(dim=1, index=token_indices[start:end, None]).squeeze(1)
         )
+    return torch.cat(chunks)
+
+
+def gather_row_entropy(
+    *,
+    logits: torch.Tensor,
+    row_indices: torch.Tensor,
+    temperatures: torch.Tensor,
+) -> torch.Tensor:
+    """Entropy in nats of softmax(logits[row] / temp) for every row."""
+    chunks = [
+        -(logprobs.exp() * logprobs).sum(dim=-1)
+        for _, _, logprobs in _iter_row_chunks(logits, row_indices, temperatures)
+    ]
+    return torch.cat(chunks)
+
+
+def belief_entropy_from_probs(
+    *, probs: torch.Tensor, temperatures: torch.Tensor
+) -> torch.Tensor:
+    """Entropy in nats of the T=1 belief behind a temperature-scaled proposal.
+
+    ``softmax(logits / T)`` pins ``logits`` down up to an additive constant, so
+    ``T * log q`` is a valid logit row and ``softmax(T * log q)`` recovers the
+    drafter's belief. Columns that a truncated draft vocab left at exactly zero
+    keep ~zero mass and contribute nothing to the sum.
+    """
+    chunks = []
+    for start in range(0, probs.shape[0], _GATHER_CHUNK_ROWS):
+        end = start + _GATHER_CHUNK_ROWS
+        rows = probs[start:end].to(torch.float32).clamp_min(_MIN_PROB)
+        belief_logits = torch.log(rows) * temperatures[start:end, None]
+        logprobs = torch.log_softmax(belief_logits, dim=-1)
+        chunks.append(-(logprobs.exp() * logprobs).sum(dim=-1))
     return torch.cat(chunks)
 
 
@@ -166,6 +220,7 @@ class SpecPqRecorder:
         num_correct_drafts: torch.Tensor,  # [bs]
         target_logits: torch.Tensor,  # [bs * rows_per_request, vocab]
         rows_per_request: int,
+        bonus_tokens: Optional[torch.Tensor] = None,  # [bs] final bonus tokens
         target_temperatures: Optional[torch.Tensor] = None,  # [bs] or [bs, 1]
         draft_logits: Optional[torch.Tensor] = None,  # [bs, num_draft, vocab]
         # [bs, num_draft, vocab], already-normalized proposal distribution
@@ -221,11 +276,14 @@ class SpecPqRecorder:
                 (bs,), float(draft_temperature), dtype=torch.float32, device=device
             )
         draft_temps_full = torch.repeat_interleave(draft_temps, num_draft)
+        draft_entropy: Optional[torch.Tensor] = None
         if draft_logits is not None:
             draft_flat_local = draft_flat - int(draft_vocab_start)
+            draft_logits_flat = draft_logits.reshape(bs * num_draft, -1)
+            draft_rows = torch.arange(bs * num_draft, device=device)
             logq = gather_row_logprobs(
-                logits=draft_logits.reshape(bs * num_draft, -1),
-                row_indices=torch.arange(bs * num_draft, device=device),
+                logits=draft_logits_flat,
+                row_indices=draft_rows,
                 token_indices=draft_flat_local,
                 temperatures=torch.where(
                     draft_temps_full > 0,
@@ -236,17 +294,36 @@ class SpecPqRecorder:
             # A greedy drafter puts all its mass on the drafted token: log q = 0.
             logq = torch.where(draft_temps_full > 0, logq, torch.zeros_like(logq))
             logq_list: list[Optional[float]] = [round(v, 6) for v in logq.tolist()]
+            draft_entropy = gather_row_entropy(
+                logits=draft_logits_flat,
+                row_indices=draft_rows,
+                temperatures=torch.ones_like(draft_temps_full),
+            )
         elif draft_probs is not None:
             # Already the normalized proposal distribution that was sampled from.
-            q = (
-                draft_probs.reshape(bs * num_draft, -1)
-                .to(torch.float32)
-                .gather(dim=1, index=(draft_flat - int(draft_vocab_start))[:, None])
-                .squeeze(1)
+            draft_probs_flat = draft_probs.reshape(bs * num_draft, -1).to(torch.float32)
+            q = draft_probs_flat.gather(
+                dim=1, index=(draft_flat - int(draft_vocab_start))[:, None]
+            ).squeeze(1)
+            logq_list = [
+                round(v, 6) for v in torch.log(q.clamp_min(_MIN_PROB)).tolist()
+            ]
+            draft_entropy = belief_entropy_from_probs(
+                probs=draft_probs_flat, temperatures=draft_temps_full
             )
-            logq_list = [round(v, 6) for v in torch.log(q.clamp_min(1e-30)).tolist()]
         else:
             logq_list = [0.0 if t <= 0 else None for t in draft_temps_full.tolist()]
+
+        if draft_entropy is None:
+            draft_entropy_list: list[Optional[float]] = [None] * (bs * num_draft)
+        else:
+            # A greedy drafter has no distribution worth measuring.
+            draft_entropy_list = [
+                None if temp <= 0 else round(value, 6)
+                for temp, value in zip(
+                    draft_temps_full.tolist(), draft_entropy.tolist()
+                )
+            ]
 
         logp_list = [round(v, 6) for v in stats.logp.tolist()]
         rank_list = stats.rank.tolist()
@@ -255,13 +332,20 @@ class SpecPqRecorder:
         entropy_list = [round(v, 6) for v in stats.entropy.tolist()]
         token_list = draft_flat.tolist()
         num_correct_list = num_correct_drafts.reshape(bs).tolist()
+        bonus_token_list = (
+            None if bonus_tokens is None else bonus_tokens.reshape(bs).tolist()
+        )
         target_temp_list = target_temps.tolist()
         draft_temp_list = draft_temps.tolist()
 
         for b in range(bs):
             num_correct = int(num_correct_list[b])
+            bonus_owner = (
+                None if bonus_token_list is None else min(num_correct, num_draft - 1)
+            )
             for j in range(num_draft):
                 flat_idx = b * num_draft + j
+                has_bonus = j == bonus_owner
                 self._buffer.append(
                     msgspec.json.encode(
                         SpecPqRecord(
@@ -280,6 +364,13 @@ class SpecPqRecorder:
                             lq=logq_list[flat_idx],
                             tt=round(float(target_temp_list[b]), 6),
                             dt=round(float(draft_temp_list[b]), 6),
+                            dent=draft_entropy_list[flat_idx],
+                            bonus_token=(
+                                int(bonus_token_list[b]) if has_bonus else None
+                            ),
+                            bonus_pos=(
+                                start_positions[b] + num_correct if has_bonus else None
+                            ),
                         )
                     )
                 )

@@ -1960,6 +1960,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 num_correct_drafts=accept_len,
                 target_logits=logits_output.next_token_logits,
                 rows_per_request=int(self.block_size),
+                bonus_tokens=bonus,
                 target_temperatures=(
                     sampling_info.temperatures if sampling_info is not None else None
                 ),

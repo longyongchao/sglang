@@ -1709,46 +1709,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 accept_index,
             ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
+        is_idle = batch.forward_mode.is_idle()
 
-        if self._pq_recorder is not None and not batch.forward_mode.is_idle():
-            num_slots = int(verify_input.draft_token_num)
-            candidates = verify_input.draft_token.reshape(bs, num_slots)
-            draft_probs = verify_input.draft_probs
-            self._pq_recorder.record_chain(
-                forward_ct=int(batch.forward_iter),
-                reqs=batch.reqs,
-                prefix_lens=batch.seq_lens,
-                draft_tokens=candidates[:, 1:],
-                # eagle_sample returns drafts + bonus; the recorder wants drafts.
-                num_correct_drafts=accept_lens - 1,
-                target_logits=logits_output.next_token_logits,
-                rows_per_request=num_slots,
-                target_temperatures=(
-                    batch.sampling_info.temperatures
-                    if batch.sampling_info is not None
-                    else None
-                ),
-                # draft_probs is None unless classic rejection sampling is on, in
-                # which case every other chain path drafts by argmax (q is a
-                # point mass).
-                draft_probs=draft_probs,
-                draft_temperature=(
-                    0.0
-                    if draft_probs is None
-                    else float(self.server_args.speculative_draft_temperature or 1.0)
-                ),
-            )
-
-        # Update mamba state for hybrid GDN models after verification
-        commit_mamba_states_after_verify(
-            self.target_worker,
-            batch,
-            accept_lens,
-            accept_index,
-            self.speculative_num_draft_tokens,
-        )
-
-        if not batch.forward_mode.is_idle():
+        if not is_idle:
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1]
@@ -1761,6 +1724,53 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
+
+        if self._pq_recorder is not None and not is_idle:
+            num_slots = int(verify_input.draft_token_num)
+            candidates = verify_input.draft_token.reshape(bs, num_slots)
+            draft_probs = verify_input.draft_probs
+            target_temperatures = (
+                batch.sampling_info.temperatures
+                if batch.sampling_info is not None
+                else None
+            )
+            # draft_probs is None unless classic rejection sampling is on, in
+            # which case every other chain path drafts by argmax (q is a point
+            # mass). Otherwise draft_probs is softmax(logits / T) for the T that
+            # renorm_draft_probs used: the override when set (0 there means
+            # argmax selection over T=1 scores), else the request temperature.
+            draft_temperature_override = self.server_args.speculative_draft_temperature
+            if draft_probs is None:
+                draft_temperature, draft_temperatures = 0.0, None
+            elif draft_temperature_override is None:
+                draft_temperature, draft_temperatures = 1.0, target_temperatures
+            else:
+                draft_temperature = float(draft_temperature_override) or 1.0
+                draft_temperatures = None
+            self._pq_recorder.record_chain(
+                forward_ct=int(batch.forward_iter),
+                reqs=batch.reqs,
+                prefix_lens=batch.seq_lens,
+                draft_tokens=candidates[:, 1:],
+                # eagle_sample returns drafts + bonus; the recorder wants drafts.
+                num_correct_drafts=accept_lens - 1,
+                bonus_tokens=bonus_tokens,
+                target_logits=logits_output.next_token_logits,
+                rows_per_request=num_slots,
+                target_temperatures=target_temperatures,
+                draft_probs=draft_probs,
+                draft_temperature=draft_temperature,
+                draft_temperatures=draft_temperatures,
+            )
+
+        # Update mamba state for hybrid GDN models after verification
+        commit_mamba_states_after_verify(
+            self.target_worker,
+            batch,
+            accept_lens,
+            accept_index,
+            self.speculative_num_draft_tokens,
+        )
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(

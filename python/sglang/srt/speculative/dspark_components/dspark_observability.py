@@ -979,6 +979,7 @@ class DsparkStepObservers:
                 num_correct_drafts=correct_len,
                 target_logits=target_logits,
                 rows_per_request=self._gamma + 1,
+                bonus_tokens=bonus,
                 target_temperatures=(
                     sampling_info.temperatures
                     if sampling_info is not None
