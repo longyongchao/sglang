@@ -6,6 +6,7 @@ from typing import Callable, ContextManager, Optional
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.speculative.dflash_utils import sample_dflash_draft_tokens
 from sglang.srt.speculative.domino_helper import DFlashDominoHelper
 from sglang.srt.speculative.domino_kernels import (
     fused_gru_cell_from_table,
@@ -901,10 +902,7 @@ class DFlashDominoRollout:
             else (num_org + block_v - 1) // block_v
         )
 
-        w_sh_T = torch.cat(
-            [state["w_s"].T.contiguous(), state["w_hh"].T.contiguous()],
-            dim=1,
-        ).contiguous()
+        w_sh_T = state["w_s_hh_T"]
         sh_buf = torch.empty((bs, emb_dim + 3 * G), dtype=z_dtype, device=device)
         s_proj_buf = sh_buf[:, :emb_dim]
         gh_buf = sh_buf[:, emb_dim:]
@@ -1207,8 +1205,14 @@ class DFlashDominoRollout:
             z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
 
         if return_logits:
-            # Eager path: accumulate per-step logits for rejection sampling.
-            # Cannot use cuda graph since we need the actual logit values.
+            # Eager path: the verifier needs the actual per-step logits, which
+            # the fused argmax kernels deliberately never materialize, so this
+            # loop cannot be a cuda graph. Everything that does not depend on
+            # the logit values is still shared with _run_domino_rollout_loop:
+            # one GEMM produces both the GRU s-projection and its hidden
+            # projection, and the GRU cell is a single fused kernel. A draft
+            # slot therefore costs a handful of launches and, thanks to
+            # sample_dflash_draft_tokens, no host synchronization.
             logits_buf = torch.empty(
                 bs, num_draft, num_org, dtype=base_logits.dtype, device=device
             )
@@ -1217,9 +1221,11 @@ class DFlashDominoRollout:
             out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
             # Sample slot_1 according to draft_temperature for consistency with RS.
             if draft_temperature > 0:
-                probs_0 = torch.softmax(base_logits[:, 0, :].float() / draft_temperature, dim=-1)
-                local_id_0 = torch.multinomial(probs_0, num_samples=1).squeeze(-1)
-                slot_1 = local_id_0.to(torch.long) + org_vocab_start
+                local_id_0 = sample_dflash_draft_tokens(
+                    logits=base_logits[:, 0, :],
+                    draft_temperature=draft_temperature,
+                )
+                slot_1 = local_id_0 + org_vocab_start
             out[:, 0].copy_(slot_1)
 
             # Initialize GRU with the (possibly re-sampled) slot_1.
@@ -1234,29 +1240,43 @@ class DFlashDominoRollout:
             fc2_w_shard, fc2_b_shard = self._slice_domino_fc2(
                 state=state, start=org_vocab_start, length=num_org
             )
+            w_sh_T = state["w_s_hh_T"]
+            sh_buf = torch.empty(
+                (bs, emb_dim + 3 * G), dtype=gru_h.dtype, device=device
+            )
+            s_proj_buf = sh_buf[:, :emb_dim]
+            gh_buf = sh_buf[:, emb_dim:]
+            h_new_buf = torch.empty_like(gru_h)
             with _seg("draft_gru_correct"):
-                gru_h_cur = gru_h
+                h_state = gru_h
                 for k in range(1, num_draft):
-                    s_proj = torch.nn.functional.linear(gru_h_cur, state["w_s"])
-                    mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj)
+                    torch.matmul(h_state, w_sh_T, out=sh_buf)
+                    mid = torch.nn.functional.silu(z_proj_all[:, k, :] + s_proj_buf)
                     bias = torch.nn.functional.linear(mid, fc2_w_shard, fc2_b_shard)
-                    logits_k = base_logits[:, k, :] + bias.to(base_logits.dtype)
-                    logits_buf[:, k, :] = logits_k
+                    logits_k = logits_buf[:, k, :]
+                    torch.add(
+                        base_logits[:, k, :],
+                        bias.to(base_logits.dtype),
+                        out=logits_k,
+                    )
                     if draft_temperature > 0:
-                        probs_k = torch.softmax(logits_k.float() / draft_temperature, dim=-1)
-                        local_id_k = torch.multinomial(probs_k, num_samples=1).squeeze(-1)
-                        tok = local_id_k.to(torch.long) + org_vocab_start
+                        local_id_k = sample_dflash_draft_tokens(
+                            logits=logits_k, draft_temperature=draft_temperature
+                        )
                     else:
-                        tok = torch.argmax(logits_k, dim=-1).to(torch.long) + org_vocab_start
+                        local_id_k = torch.argmax(logits_k, dim=-1).to(torch.long)
+                    tok = local_id_k + org_vocab_start
                     out[:, k].copy_(tok)
                     if k + 1 < num_draft:
-                        gi = self._domino_lookup_gru_input_proj_full(
-                            token_ids=tok,
-                            full_gru_input_table=gru_input_table,
+                        fused_gru_cell_from_table(
+                            tok_full=tok,
+                            gru_input_table=gru_input_table,
+                            gh=gh_buf,
+                            gh_bias=state["b_hh"],
+                            h_state=h_state,
+                            h_out=h_new_buf,
                         )
-                        gru_h_cur = self._domino_manual_gru_step_from_input_proj(
-                            gi=gi, gru_h=gru_h_cur, state=state
-                        )
+                        h_state = h_new_buf
             return out, logits_buf
 
         with _seg("draft_gru_correct"):

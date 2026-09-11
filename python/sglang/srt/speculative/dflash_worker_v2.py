@@ -34,6 +34,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_domino_projector,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+    sample_dflash_draft_tokens,
 )
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
@@ -382,6 +383,24 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
 
+    def _draft_logits_needed_for_verify(self) -> bool:
+        """Whether every decode step will have to re-run the draft head eagerly.
+
+        With a sampled draft the verifier needs the per-step draft logits, and
+        the graph-folded head never produces them (see the need_draft_logits
+        gate in the decode path), so the proposal always falls back to eager.
+        The folded head would then be replayed and discarded on every step --
+        for Domino that is the whole rollout, roughly 0.85 ms per step at
+        block_size 16 -- so it is better not to capture it at all. The cost is
+        that a fully greedy batch served by a sampled drafter also stays eager.
+        """
+        draft_temp = self.server_args.speculative_draft_temperature
+        return (
+            draft_temp is not None
+            and draft_temp > 0
+            and is_dflash_sampling_verify_available()
+        )
+
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
             if self.tp_rank == 0:
@@ -392,6 +411,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _eager("tp>1")
         if self.block_size <= 1:
             return _eager("block_size<=1")
+        if self._draft_logits_needed_for_verify():
+            return _eager("sampled draft needs eager per-step logits")
         target_model = self._target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not hasattr(lm_head, "weight"):
@@ -429,6 +450,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _eager("tp>1")
         if self.block_size <= 1:
             return _eager("block_size<=1")
+        if self._draft_logits_needed_for_verify():
+            return _eager("sampled draft needs eager per-step logits")
         target_model = self._target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not hasattr(lm_head, "weight"):
@@ -1081,8 +1104,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits = torch.matmul(hs, weight[:num_org].T)  # [num_tokens, num_org]
         if draft_temperature > 0:
             # Sample from the draft distribution to match rejection sampling q.
-            probs = torch.softmax(logits.float() / draft_temperature, dim=-1)
-            local_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            local_ids = sample_dflash_draft_tokens(
+                logits=logits, draft_temperature=draft_temperature
+            )
         else:
             local_ids = torch.argmax(logits, dim=-1)
         tokens = local_ids.to(torch.long) + org_vocab_start

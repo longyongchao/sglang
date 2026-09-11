@@ -13,6 +13,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
+    SampleStepTokens,
+)
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -61,6 +64,74 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+_DFLASH_DRAFT_SAMPLER_ROW_ARGS: dict[
+    tuple[str, Optional[int], int, float], tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _dflash_draft_sampler_row_args(
+    *,
+    num_rows: int,
+    draft_temperature: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cached per-row temperature and greedy-mask operands of the draft sampler.
+
+    Both are constant for a given (num_rows, draft_temperature) pair, so caching
+    them keeps two allocations and two kernel launches out of every draft slot of
+    the eager rollout.
+    """
+    key = (device.type, device.index, int(num_rows), float(draft_temperature))
+    cached = _DFLASH_DRAFT_SAMPLER_ROW_ARGS.get(key)
+    if cached is None:
+        cached = (
+            torch.full(
+                (int(num_rows),),
+                max(float(draft_temperature), 1e-5),
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.zeros((int(num_rows),), dtype=torch.bool, device=device),
+        )
+        _DFLASH_DRAFT_SAMPLER_ROW_ARGS[key] = cached
+    return cached
+
+
+def sample_dflash_draft_tokens(
+    *,
+    logits: torch.Tensor,
+    draft_temperature: float,
+) -> torch.Tensor:
+    """Draw one local vocab id per row of ``logits`` at ``draft_temperature``.
+
+    Distributionally identical to ``multinomial(softmax(logits / T))``: with
+    ``E_i`` iid ``Exp(1)``, ``argmax_i p_i / E_i`` is exactly ``Categorical(p)``.
+    The point of taking that route is what it avoids. ``torch.multinomial``
+    validates its input by reading a device scalar with ``.item()``, so it
+    synchronizes with the host twice per call, and it needs the full
+    ``[num_rows, vocab]`` probability tensor. The exponential race is fused into
+    an online reduction that never leaves the device. The eager
+    rejection-sampling rollout calls this once per draft slot, so both costs are
+    paid ``block_size - 1`` times per decode step.
+
+    ``logits`` rows must be contiguous; a ``[bs, block, vocab]`` slice qualifies.
+    """
+    temperatures, greedy_mask = _dflash_draft_sampler_row_args(
+        num_rows=int(logits.shape[0]),
+        draft_temperature=draft_temperature,
+        device=logits.device,
+    )
+    exp_noise = torch.empty(
+        logits.shape, dtype=torch.float32, device=logits.device
+    ).exponential_(1)
+    return SampleStepTokens.execute(
+        step_logits=logits,
+        temperatures=temperatures,
+        greedy_mask=greedy_mask,
+        exp_noise=exp_noise,
+    )
 
 
 def resolve_dflash_prefill_refill_target(max_running_requests: int) -> int:

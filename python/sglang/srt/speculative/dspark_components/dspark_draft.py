@@ -149,6 +149,7 @@ def maybe_build_draft_sampler(
     tp_rank: int,
     confidence_fn=None,
     out=None,
+    draft_temperature: Optional[float] = None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded greedy draft sampler, or return None (with the
     reason logged) when the draft model cannot support folding and the
@@ -161,6 +162,14 @@ def maybe_build_draft_sampler(
 
     if gamma <= 0:
         return _eager("gamma<=0")
+    if draft_temperature is not None and draft_temperature > 0:
+        # A sampled draft needs corrected_logits for rejection sampling, which
+        # the folded path does not produce, so propose() takes the eager branch
+        # for every non-greedy batch. Capturing the rollout anyway means
+        # replaying and discarding roughly 0.9 ms of graph work per decode step.
+        # The cost of skipping capture is that a fully greedy batch served by a
+        # sampled drafter also stays eager.
+        return _eager("sampled draft needs corrected logits")
     if not hasattr(draft_model, "compute_base_logits"):
         return _eager("no compute_base_logits")
     if getattr(draft_model, "markov_head", None) is None:

@@ -358,6 +358,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_epilogue is not None
                 else None
             ),
+            draft_temperature=self.server_args.speculative_draft_temperature,
         )
 
     def clear_cache_pool(self):
