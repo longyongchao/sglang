@@ -14,6 +14,7 @@ from sglang.srt.speculative.domino_kernels import (
     fused_silu_fc2_argmax_with_value,
     fused_silu_fc2_candidate_argmax,
     fused_silu_fc2_candidate_argmax_with_value,
+    fused_silu_fc2_sample,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,10 @@ _DOMINO_CANDIDATE_BLOCK_C = 512
 _DOMINO_CANDIDATE_POOL_SIZE = 0  # Disable candidate pool; use full-vocab scoring like DSpark
 _DOMINO_TP_SCORER_CUSHION_MB = 2048
 _DOMINO_TP_GRU_TABLE_CUSHION_MB = 1024
+# Each captured rejection-sampling batch size pins its own [bs, num_draft,
+# vocab] base-logits and logits buffers, so the pool is bounded explicitly
+# rather than growing with the number of distinct decode batch sizes.
+_DOMINO_RS_GRAPH_POOL_BUDGET_MB = 1024
 
 
 class DFlashDominoRollout:
@@ -1001,6 +1006,253 @@ class DFlashDominoRollout:
         )
         return entry
 
+    def _run_domino_rs_rollout_loop(
+        self,
+        *,
+        out_target: torch.Tensor,
+        logits_target: torch.Tensor,
+        num_draft: int,
+        org_vocab_start: int,
+        gru_h: torch.Tensor,
+        z_proj: torch.Tensor,
+        base_logits: torch.Tensor,
+        w_sh_T: torch.Tensor,
+        sh_buf: torch.Tensor,
+        s_proj_buf: torch.Tensor,
+        gh_buf: torch.Tensor,
+        h_new_buf: torch.Tensor,
+        race_val_buf: torch.Tensor,
+        race_idx_buf: torch.Tensor,
+        local_tok_buf: torch.Tensor,
+        exp_noise_buf: Optional[torch.Tensor],
+        inv_temperature: float,
+        fc2_w_shard: torch.Tensor,
+        fc2_b_shard: Optional[torch.Tensor],
+        b_hh_static: Optional[torch.Tensor],
+        gru_input_table: torch.Tensor,
+    ) -> None:
+        '''Capture-safe rejection-sampling rollout over draft slots 2..block_size-1.
+
+        Same shape as _run_domino_rollout_loop, with two extra obligations per
+        slot: the verifier needs the whole logit row to evaluate q, and the token
+        must be drawn from softmax(logits / T) rather than argmax'd. Both are
+        folded into the fc2 matmul by fused_silu_fc2_sample, so a slot still
+        costs one full-vocab pass plus the GRU cell.
+        '''
+
+        # Slot 1 carries no GRU bias, so its logits are the base logits.
+        logits_target[:, 0, :].copy_(base_logits[:, 0, :])
+        h_state = gru_h
+        for k in range(1, num_draft):
+            torch.matmul(h_state, w_sh_T, out=sh_buf)
+            if exp_noise_buf is not None:
+                # 每个 slot 一份新噪声；graph replay 会推进 philox offset，所以
+                # 同一张图每次 replay 都在新的噪声上抽样。
+                exp_noise_buf.exponential_(1)
+            fused_silu_fc2_sample(
+                z_proj=z_proj[:, k, :],
+                s_proj=s_proj_buf,
+                fc2_weight=fc2_w_shard,
+                fc2_bias=fc2_b_shard,
+                base_logits=base_logits[:, k, :],
+                logits_out=logits_target[:, k, :],
+                exp_noise=exp_noise_buf,
+                inv_temperature=inv_temperature,
+                out_val=race_val_buf,
+                out_idx=race_idx_buf,
+                final_token=local_tok_buf,
+                block_v=_DOMINO_BLOCK_V,
+                block_m=_DOMINO_BLOCK_M,
+                num_warps=_DOMINO_SCORE_NUM_WARPS,
+                num_stages=_DOMINO_SCORE_NUM_STAGES,
+            )
+            tok_full = local_tok_buf + org_vocab_start
+            out_target[:, k] = tok_full
+            if k + 1 < num_draft:
+                fused_gru_cell_from_table(
+                    tok_full=tok_full,
+                    gru_input_table=gru_input_table,
+                    gh=gh_buf,
+                    gh_bias=b_hh_static,
+                    h_state=h_state,
+                    h_out=h_new_buf,
+                )
+                h_state = h_new_buf
+
+    def _get_or_capture_domino_rs_loop_graph(
+        self,
+        *,
+        bs: int,
+        num_draft: int,
+        emb_dim: int,
+        gru_hidden: int,
+        num_org: int,
+        org_vocab_start: int,
+        z_dtype: torch.dtype,
+        logits_dtype: torch.dtype,
+        inv_temperature: float,
+        device: torch.device,
+        state: dict,
+        gru_input_table: torch.Tensor,
+    ):
+        """Capture or return the CUDA graph for the rejection-sampling rollout.
+
+        Returns None when the static buffers would blow the pool budget; the
+        caller then stays on the eager loop, which is also the CPU path.
+        """
+
+        pool = getattr(self, "_domino_rs_loop_graph_pool", None)
+        if pool is None:
+            pool = {}
+            self._domino_rs_loop_graph_pool = pool
+
+        pool_key = (
+            bs,
+            num_draft,
+            emb_dim,
+            gru_hidden,
+            num_org,
+            org_vocab_start,
+            z_dtype,
+            logits_dtype,
+            float(inv_temperature),
+        )
+        entry = pool.get(pool_key)
+        if entry is not None:
+            return entry
+
+        # The two [bs, num_draft, vocab] tensors dominate; the [bs, vocab] fp32
+        # noise scratch is the only other non-trivial one.
+        logits_bytes = torch.empty((), dtype=logits_dtype).element_size()
+        entry_mb = (
+            bs * num_org * (2 * num_draft * logits_bytes + (4 if inv_temperature > 0 else 0))
+        ) / (1024 * 1024)
+        pool_mb = getattr(self, "_domino_rs_loop_graph_pool_mb", 0.0)
+        if pool_mb + entry_mb > _DOMINO_RS_GRAPH_POOL_BUDGET_MB:
+            if not getattr(self, "_domino_rs_graph_budget_warned", False):
+                self._domino_rs_graph_budget_warned = True
+                logger.warning(
+                    "[DFLASH Domino] rejection-sampling rollout stays eager for "
+                    "bs=%d: capturing it needs %.0f MiB of static buffers and "
+                    "the pool already holds %.0f MiB of %d MiB.",
+                    bs,
+                    entry_mb,
+                    pool_mb,
+                    _DOMINO_RS_GRAPH_POOL_BUDGET_MB,
+                )
+            return None
+
+        G = gru_hidden
+        num_v_blocks = (num_org + _DOMINO_BLOCK_V - 1) // _DOMINO_BLOCK_V
+        z_proj_buf = torch.empty(
+            (bs, num_draft, emb_dim), dtype=z_dtype, device=device
+        )
+        base_logits_buf = torch.empty(
+            (bs, num_draft, num_org), dtype=logits_dtype, device=device
+        )
+        logits_buf = torch.empty(
+            (bs, num_draft, num_org), dtype=logits_dtype, device=device
+        )
+        gru_h_buf = torch.empty((bs, G), dtype=z_dtype, device=device)
+        out_buf = torch.empty((bs, num_draft), dtype=torch.long, device=device)
+        sh_buf = torch.empty((bs, emb_dim + 3 * G), dtype=z_dtype, device=device)
+        s_proj_buf = sh_buf[:, :emb_dim]
+        gh_buf = sh_buf[:, emb_dim:]
+        h_new_buf = torch.empty((bs, G), dtype=z_dtype, device=device)
+        race_val_buf = torch.empty(
+            (bs, num_v_blocks), dtype=torch.float32, device=device
+        )
+        race_idx_buf = torch.empty(
+            (bs, num_v_blocks), dtype=torch.int32, device=device
+        )
+        local_tok_buf = torch.empty((bs,), dtype=torch.long, device=device)
+        sampling = inv_temperature > 0
+        exp_noise_buf = (
+            torch.empty((bs, num_org), dtype=torch.float32, device=device)
+            if sampling
+            else None
+        )
+        fc2_w_shard, fc2_b_shard = self._slice_domino_fc2(
+            state=state,
+            start=org_vocab_start,
+            length=num_org,
+        )
+        w_sh_T = state["w_s_hh_T"]
+        b_hh_static = state["b_hh"]
+
+        static_refs = [
+            z_proj_buf,
+            base_logits_buf,
+            logits_buf,
+            gru_h_buf,
+            out_buf,
+            sh_buf,
+            h_new_buf,
+            race_val_buf,
+            race_idx_buf,
+            local_tok_buf,
+            fc2_w_shard,
+            w_sh_T,
+            gru_input_table,
+        ]
+        for optional_ref in (fc2_b_shard, b_hh_static, exp_noise_buf):
+            if optional_ref is not None:
+                static_refs.append(optional_ref)
+
+        def run_loop(out_target):
+            self._run_domino_rs_rollout_loop(
+                out_target=out_target,
+                logits_target=logits_buf,
+                num_draft=num_draft,
+                org_vocab_start=org_vocab_start,
+                gru_h=gru_h_buf,
+                z_proj=z_proj_buf,
+                base_logits=base_logits_buf,
+                w_sh_T=w_sh_T,
+                sh_buf=sh_buf,
+                s_proj_buf=s_proj_buf,
+                gh_buf=gh_buf,
+                h_new_buf=h_new_buf,
+                race_val_buf=race_val_buf,
+                race_idx_buf=race_idx_buf,
+                local_tok_buf=local_tok_buf,
+                exp_noise_buf=exp_noise_buf,
+                inv_temperature=inv_temperature,
+                fc2_w_shard=fc2_w_shard,
+                fc2_b_shard=fc2_b_shard,
+                b_hh_static=b_hh_static,
+                gru_input_table=gru_input_table,
+            )
+
+        warmup_out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
+        for _ in range(2):
+            run_loop(warmup_out)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_loop(out_buf)
+
+        entry = {
+            "graph": graph,
+            "z_proj_buf": z_proj_buf,
+            "base_logits_buf": base_logits_buf,
+            "logits_buf": logits_buf,
+            "gru_h_buf": gru_h_buf,
+            "out_buf": out_buf,
+            "_static_refs": static_refs,
+        }
+        pool[pool_key] = entry
+        self._domino_rs_loop_graph_pool_mb = pool_mb + entry_mb
+        logger.warning(
+            "[DFLASH Domino] captured CUDA graph for the rejection-sampling "
+            "rollout loop bs=%d num_draft=%d (%.0f MiB static buffers).",
+            bs,
+            num_draft,
+            entry_mb,
+        )
+        return entry
+
     def build_capture_sampler(
         self,
         *,
@@ -1205,28 +1457,14 @@ class DFlashDominoRollout:
             z_proj_all = torch.nn.functional.linear(z, state["w_z"], state["b1"])
 
         if return_logits:
-            # Eager path: the verifier needs the actual per-step logits, which
-            # the fused argmax kernels deliberately never materialize, so this
-            # loop cannot be a cuda graph. Everything that does not depend on
-            # the logit values is still shared with _run_domino_rollout_loop:
-            # one GEMM produces both the GRU s-projection and its hidden
-            # projection, and the GRU cell is a single fused kernel. A draft
-            # slot therefore costs a handful of launches and, thanks to
-            # sample_dflash_draft_tokens, no host synchronization.
-            logits_buf = torch.empty(
-                bs, num_draft, num_org, dtype=base_logits.dtype, device=device
-            )
-            # Slot 0: pure base_logits (no GRU bias for the first draft token).
-            logits_buf[:, 0, :] = base_logits[:, 0, :]
-            out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
-            # Sample slot_1 according to draft_temperature for consistency with RS.
+            # Slot 1 is drawn from the base logits alone (no GRU bias yet) and
+            # its draw is what primes the GRU, so it stays eager either way.
             if draft_temperature > 0:
                 local_id_0 = sample_dflash_draft_tokens(
                     logits=base_logits[:, 0, :],
                     draft_temperature=draft_temperature,
                 )
                 slot_1 = local_id_0 + org_vocab_start
-            out[:, 0].copy_(slot_1)
 
             # Initialize GRU with the (possibly re-sampled) slot_1.
             gru_h = self._init_domino_prefix_gru_hidden(
@@ -1236,6 +1474,51 @@ class DFlashDominoRollout:
                 state=state,
                 full_gru_input_table=gru_input_table,
             )
+            inv_temperature = (
+                1.0 / max(draft_temperature, 1e-5) if draft_temperature > 0 else 0.0
+            )
+            graph_entry = (
+                self._get_or_capture_domino_rs_loop_graph(
+                    bs=bs,
+                    num_draft=num_draft,
+                    emb_dim=emb_dim,
+                    gru_hidden=G,
+                    num_org=num_org,
+                    org_vocab_start=org_vocab_start,
+                    z_dtype=z.dtype,
+                    logits_dtype=base_logits.dtype,
+                    inv_temperature=inv_temperature,
+                    device=device,
+                    state=state,
+                    gru_input_table=gru_input_table,
+                )
+                if device.type == "cuda"
+                else None
+            )
+            if graph_entry is not None:
+                with _seg("draft_gru_correct"):
+                    graph_entry["z_proj_buf"].copy_(z_proj_all)
+                    graph_entry["base_logits_buf"].copy_(base_logits)
+                    graph_entry["gru_h_buf"].copy_(gru_h)
+                    graph_entry["out_buf"][:, 0].copy_(slot_1)
+                    graph_entry["graph"].replay()
+                return graph_entry["out_buf"], graph_entry["logits_buf"]
+
+            # Eager reference loop: the CPU path, and the fallback for batch
+            # sizes whose static buffers do not fit the graph pool budget.
+            # Everything that does not depend on the logit values is shared with
+            # _run_domino_rollout_loop: one GEMM produces both the GRU
+            # s-projection and its hidden projection, and the GRU cell is a
+            # single fused kernel. A draft slot therefore costs a handful of
+            # launches and, thanks to sample_dflash_draft_tokens, no host
+            # synchronization.
+            logits_buf = torch.empty(
+                bs, num_draft, num_org, dtype=base_logits.dtype, device=device
+            )
+            # Slot 0: pure base_logits (no GRU bias for the first draft token).
+            logits_buf[:, 0, :] = base_logits[:, 0, :]
+            out = torch.empty((bs, num_draft), dtype=torch.long, device=device)
+            out[:, 0].copy_(slot_1)
 
             fc2_w_shard, fc2_b_shard = self._slice_domino_fc2(
                 state=state, start=org_vocab_start, length=num_org

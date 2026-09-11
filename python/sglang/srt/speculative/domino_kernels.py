@@ -11,8 +11,13 @@ launches. These kernels collapse the small ops:
      argmax token. Avoids materializing the full [B, V] bias tensor.
   2. ``fused_gru_cell_from_table`` — fuses GRU input-table lookup and the
      sigmoid/tanh/gate update into one kernel.
+  3. ``fused_silu_fc2_sample`` — the rejection-sampling variant of (1). The
+     verifier needs the whole logit row, so this one does materialize [B, V],
+     but it writes it exactly once and finishes the categorical draw in the same
+     pass, instead of following the matmul with separate bias-add, softmax,
+     noise and argmax passes.
 
-Both kernels are CUDA-graph friendly (no host-driven sync, fixed shapes).
+All kernels are CUDA-graph friendly (no host-driven sync, fixed shapes).
 """
 
 from __future__ import annotations
@@ -336,6 +341,200 @@ def fused_silu_fc2_argmax(
         BLOCK_V=block_v,
         BLOCK_M=block_m,
         HAS_FC2_BIAS=has_fc2_bias,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    _domino_reduce_argmax_kernel[(B,)](
+        out_val, out_idx, final_token,
+        num_v_blocks,
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        final_token.stride(0),
+        BLOCK_N=512,
+        num_warps=1,
+    )
+
+
+@triton.jit
+def _domino_fused_silu_fc2_sample_kernel(
+    z_ptr, s_ptr,
+    fc2_ptr, base_ptr, fc2_bias_ptr,
+    logits_ptr, exp_noise_ptr,
+    out_val_ptr, out_idx_ptr,
+    B, M, V,
+    stride_z_b, stride_z_m,
+    stride_s_b, stride_s_m,
+    stride_f2_v, stride_f2_m,
+    stride_base_b, stride_base_v,
+    stride_logits_b, stride_logits_v,
+    stride_noise_b, stride_noise_v,
+    stride_outv_b, stride_outv_n,
+    stride_outi_b, stride_outi_n,
+    inv_temperature,
+    BLOCK_B: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_FC2_BIAS: tl.constexpr,
+    HAS_NOISE: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_v = tl.program_id(1)
+
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = offs_b < B
+    offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
+    mask_v = offs_v < V
+
+    acc = tl.zeros([BLOCK_B, BLOCK_V], dtype=tl.float32)
+    fc2_dtype = fc2_ptr.dtype.element_ty
+
+    for m_start in range(0, M, BLOCK_M):
+        offs_m = m_start + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
+        mask_bm = mask_b[:, None] & mask_m[None, :]
+
+        z_block = tl.load(
+            z_ptr + offs_b[:, None] * stride_z_b + offs_m[None, :] * stride_z_m,
+            mask=mask_bm, other=0.0,
+        ).to(tl.float32)
+        s_block = tl.load(
+            s_ptr + offs_b[:, None] * stride_s_b + offs_m[None, :] * stride_s_m,
+            mask=mask_bm, other=0.0,
+        ).to(tl.float32)
+        preact = z_block + s_block
+        mid_block = (preact * tl.sigmoid(preact)).to(fc2_dtype)
+
+        fc2_ptrs = (
+            fc2_ptr
+            + offs_v[:, None] * stride_f2_v
+            + offs_m[None, :] * stride_f2_m
+        )
+        fc2_block = tl.load(
+            fc2_ptrs,
+            mask=mask_v[:, None] & mask_m[None, :],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+
+        acc = tl.dot(mid_block, tl.trans(fc2_block), acc)
+
+    if HAS_FC2_BIAS:
+        bias_block = tl.load(
+            fc2_bias_ptr + offs_v, mask=mask_v, other=0.0
+        ).to(tl.float32)
+        acc += bias_block[None, :]
+
+    base_block = tl.load(
+        base_ptr + offs_b[:, None] * stride_base_b + offs_v[None, :] * stride_base_v,
+        mask=mask_b[:, None] & mask_v[None, :], other=-float("inf"),
+        cache_modifier=".cg",
+    ).to(tl.float32)
+    acc += base_block
+
+    # 验证阶段读的是这份 logits，所以采样也必须在同一个精度边界上进行：先落回
+    # 存储精度，再拿它算 key，避免 q(x) 与被抽中的 token 来自两份不同的数。
+    logits_block = acc.to(logits_ptr.dtype.element_ty)
+    tl.store(
+        logits_ptr
+        + offs_b[:, None] * stride_logits_b
+        + offs_v[None, :] * stride_logits_v,
+        logits_block,
+        mask=mask_b[:, None] & mask_v[None, :],
+    )
+
+    key = logits_block.to(tl.float32)
+    if HAS_NOISE:
+        # E ~ Exp(1) 时 argmax_i p_i / E_i 就是从 Categorical(p) 抽样；取 log 之后
+        # softmax 的归一化常数沿行恒定可以丢掉，于是退化成一次普通 argmax。噪声由
+        # curand 在 kernel 外批量生成：kernel 内的 philox 每个元素要跑满 10 轮，
+        # 实测 bs=64 时比读一份预生成的噪声贵 4 倍。
+        noise = tl.load(
+            exp_noise_ptr
+            + offs_b[:, None] * stride_noise_b
+            + offs_v[None, :] * stride_noise_v,
+            mask=mask_b[:, None] & mask_v[None, :],
+            other=1.0,
+            cache_modifier=".cg",
+        )
+        key = key * inv_temperature - tl.log(noise)
+    key = tl.where(mask_v[None, :], key, -float("inf"))
+
+    local_max_val = tl.max(key, axis=1)
+    local_max_idx = tl.argmax(key, axis=1)
+    global_max_idx = pid_v * BLOCK_V + local_max_idx
+
+    tl.store(
+        out_val_ptr + offs_b * stride_outv_b + pid_v * stride_outv_n,
+        local_max_val, mask=mask_b,
+    )
+    tl.store(
+        out_idx_ptr + offs_b * stride_outi_b + pid_v * stride_outi_n,
+        global_max_idx, mask=mask_b,
+    )
+
+
+def fused_silu_fc2_sample(
+    *,
+    z_proj: torch.Tensor,        # [B, M]
+    s_proj: torch.Tensor,        # [B, M]
+    fc2_weight: torch.Tensor,    # [V, M]
+    fc2_bias: torch.Tensor | None,  # [V] or None
+    base_logits: torch.Tensor,   # [B, V]
+    logits_out: torch.Tensor,    # [B, V] destination, base_logits dtype
+    exp_noise: torch.Tensor | None,  # [B, V] fp32 Exp(1), required when sampling
+    inv_temperature: float,      # 1 / T, <= 0 means greedy
+    out_val: torch.Tensor,       # [B, num_v_blocks] fp32 scratch
+    out_idx: torch.Tensor,       # [B, num_v_blocks] int32 scratch
+    final_token: torch.Tensor,   # [B] int64 destination, local vocab ids
+    block_v: int = 128,
+    block_m: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 3,
+) -> None:
+    """Fused scoring + categorical draw for the rejection-sampling rollout.
+
+    Same matmul as ``fused_silu_fc2_argmax``, but the logit row is written to
+    ``logits_out`` (the verifier needs q) and the token is drawn instead of
+    argmax'd. Both happen while the block is still in registers, so the chain
+    fc2 -> bias add -> softmax -> noise divide -> argmax collapses from five
+    full-vocab passes to one.
+
+    ``exp_noise`` is generated by the caller (``Tensor.exponential_``) rather
+    than inside the kernel; see the noise comment in the kernel.
+    """
+    B, M = z_proj.shape
+    V = base_logits.shape[1]
+    num_v_blocks = (V + block_v - 1) // block_v
+    block_b = _score_block_b(B)
+    has_fc2_bias = fc2_bias is not None
+    fc2_bias_arg = fc2_bias if has_fc2_bias else out_val  # placeholder ptr
+    has_noise = inv_temperature > 0
+    if has_noise and exp_noise is None:
+        raise ValueError("fused_silu_fc2_sample needs exp_noise when sampling")
+    noise_arg = exp_noise if has_noise else out_val  # placeholder ptr
+
+    # dim0 必须是批维，见 kernel 内的 L2 复用说明。
+    grid_main = ((B + block_b - 1) // block_b, num_v_blocks)
+    _domino_fused_silu_fc2_sample_kernel[grid_main](
+        z_proj, s_proj,
+        fc2_weight, base_logits, fc2_bias_arg,
+        logits_out, noise_arg,
+        out_val, out_idx,
+        B, M, V,
+        z_proj.stride(0), z_proj.stride(1),
+        s_proj.stride(0), s_proj.stride(1),
+        fc2_weight.stride(0), fc2_weight.stride(1),
+        base_logits.stride(0), base_logits.stride(1),
+        logits_out.stride(0), logits_out.stride(1),
+        noise_arg.stride(0), noise_arg.stride(1),
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        float(inv_temperature),
+        BLOCK_B=block_b,
+        BLOCK_V=block_v,
+        BLOCK_M=block_m,
+        HAS_FC2_BIAS=has_fc2_bias,
+        HAS_NOISE=has_noise,
         num_warps=num_warps,
         num_stages=num_stages,
     )
