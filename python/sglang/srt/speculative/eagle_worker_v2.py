@@ -345,6 +345,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_steps, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
 
+    def _can_use_chain_argmax(self, bs: int) -> bool:
+        """Whether topk_p's values are dead, so argmax can replace softmax+topk.
+
+        topk == 1 degenerates the draft tree into a chain, and draft_forward's
+        chain fast path returns constant parent/score indices without ever
+        reading score_list -- so only topk_index matters, and argmax(logits) is
+        index-identical to fast_topk(softmax(logits), 1).
+
+        Bounded by the same prealloc the fast path checks: the oversized-batch
+        fallback does feed score_list to organize_draft_results, and there the
+        chain's monotonically decreasing real scores are what keeps the
+        descending topk in chain order. max_bs covers cuda_graph max_bs and
+        max_running_requests, so the bound holds in practice.
+
+        Gated to CUDA: see #26358 -- ROCm's argmax tie-break corrupts MTP draft
+        selection on FP8 logits.
+        """
+        return (
+            self.topk == 1
+            and not _is_hip
+            and bs <= self._topk1_parents_prealloc.shape[0]
+        )
+
     def _validate_hot_token_id(self):
         if self.hot_token_id is None:
             return
@@ -671,6 +694,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.use_classic_rejection_sampling:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
+        # token_list[0] is tree_info[1] of step 0, i.e. this topk_index
+        # (spec_utils.py:317), so this is the same bs the chain fast path
+        # below bound-checks.
+        use_chain_argmax = self._can_use_chain_argmax(topk_index.shape[0])
+
         # Forward multiple steps
         scores = None
         if self.index_share_for_mtp_iteration:
@@ -731,15 +759,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_sample(probs, num_samples=1)
                     draft_probs_list.append(probs)
-                elif self.use_eagle3_rejection_sampling:
-                    probs = renorm_draft_probs(
-                        logits_output.next_token_logits,
-                        forward_batch.sampling_info,
-                        True,
-                        self.speculative_draft_temperature,
-                    )
-                    topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-                elif self.topk == 1 and not _is_hip:
+                elif use_chain_argmax:
                     topk_index = torch.argmax(
                         logits_output.next_token_logits, dim=-1, keepdim=True
                     )
@@ -1025,18 +1045,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             ret_topk_p, ret_topk_index = fast_sample(probs, num_samples=1)
             ret_draft_probs = probs
-        elif self.use_eagle3_rejection_sampling:
-            probs = renorm_draft_probs(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                True,
-                self.speculative_draft_temperature,
-            )
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-            ret_draft_probs = None
-        elif self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
+        elif self._can_use_chain_argmax(draft_logits_output.next_token_logits.shape[0]):
             ret_topk_index = torch.argmax(
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
