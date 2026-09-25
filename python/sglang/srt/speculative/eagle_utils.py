@@ -472,21 +472,29 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        target_probs = top_k_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ks, verify_input.draft_token_num, dim=0
-            ),
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        target_probs = top_p_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ps, verify_input.draft_token_num, dim=0
-            ),
-        )
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+        # top_k=TOP_K_ALL / top_p=1.0 让这两个 renorm 退化成恒等变换，但每个
+        # 仍要付一份 (bs * num_draft_tokens, vocab_size) fp32 分配加一趟读写。
+        # 标志位是保守的（merge_batch 用 |=，filter_batch 不动它），False 意味着
+        # 批内每个请求都没要求过滤，跳过是安全的。
+        if sampling_info.need_top_k_sampling:
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                ),
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+        if sampling_info.need_top_p_sampling:
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                ),
+            )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        target_probs = target_probs.reshape(
+            bs, verify_input.draft_token_num, -1
+        ).contiguous()
         # One coin is consumed per tree node and one more for the bonus token.
         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
