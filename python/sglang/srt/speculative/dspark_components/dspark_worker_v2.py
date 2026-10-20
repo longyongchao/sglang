@@ -35,6 +35,9 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
+from sglang.srt.speculative.dspark_components.dspark_sampled_draft_graph import (
+    maybe_build_sampled_draft_graph,
+)
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     DsparkStepObservers,
     InfoSegment,
@@ -337,6 +340,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
+                self._proposer.attach_sampled_graph(
+                    maybe_build_sampled_draft_graph(
+                        draft_model=self.draft_model,
+                        gamma=self.gamma,
+                        capture_bs=self.server_args.cuda_graph_config.decode.bs,
+                        device=self.device,
+                        tp_rank=self.tp_rank,
+                        dp_moe_sync=self._draft_is_moe
+                        and self.server_args.enable_dp_attention,
+                        draft_temperature=self.server_args.speculative_draft_temperature,
+                    )
+                )
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )

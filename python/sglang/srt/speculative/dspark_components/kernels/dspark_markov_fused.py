@@ -189,6 +189,123 @@ def _dspark_reduce_argmax_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Kernel 1c: Fused latent @ markov_w2.T + base_logits -> write logits -> sample
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _dspark_fused_markov_bias_sample_kernel(
+    latent_ptr,  # [B, R]
+    fc2_ptr,  # [V, R] markov_w2.weight
+    base_ptr,  # [B, V] base_logits for current step
+    logits_ptr,  # [B, V] destination: corrected logits (q) for the verifier
+    temperatures_ptr,  # [B] fp32, already clamped
+    greedy_mask_ptr,  # [B] int32, nonzero -> argmax row
+    exp_noise_ptr,  # [B, V] fp32 Exp(1)
+    out_val_ptr,  # [B, num_v_blocks] fp32
+    out_idx_ptr,  # [B, num_v_blocks] int32
+    B,
+    R,
+    V,
+    stride_latent_b, stride_latent_r,
+    stride_f2_v, stride_f2_r,
+    stride_base_b, stride_base_v,
+    stride_logits_b, stride_logits_v,
+    stride_noise_b, stride_noise_v,
+    stride_outv_b, stride_outv_n,
+    stride_outi_b, stride_outi_n,
+    BLOCK_B: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    """Pass 1 of the sampled path: same tiling as the argmax kernel, plus the
+    logits store and the exponential-race key."""
+    pid_b = tl.program_id(0)
+    pid_v = tl.program_id(1)
+
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = offs_b < B
+    offs_v = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
+    mask_v = offs_v < V
+    mask_bv = mask_b[:, None] & mask_v[None, :]
+
+    acc = tl.zeros([BLOCK_B, BLOCK_V], dtype=tl.float32)
+    fc2_dtype = fc2_ptr.dtype.element_ty
+
+    for r_start in range(0, R, BLOCK_R):
+        offs_r = r_start + tl.arange(0, BLOCK_R)
+        mask_r = offs_r < R
+        latent_block = tl.load(
+            latent_ptr + offs_b[:, None] * stride_latent_b
+            + offs_r[None, :] * stride_latent_r,
+            mask=mask_b[:, None] & mask_r[None, :],
+            other=0.0,
+        ).to(fc2_dtype)
+        fc2_block = tl.load(
+            fc2_ptr
+            + offs_v[:, None] * stride_f2_v
+            + offs_r[None, :] * stride_f2_r,
+            mask=mask_v[:, None] & mask_r[None, :],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        acc = tl.dot(latent_block, tl.trans(fc2_block), acc)
+
+    # 精度边界与 argmax kernel 一致（对齐 eager 的 linear + add）。
+    input_dtype = base_ptr.dtype.element_ty
+    projected = acc.to(input_dtype)
+    base_block = tl.load(
+        base_ptr + offs_b[:, None] * stride_base_b + offs_v[None, :] * stride_base_v,
+        mask=mask_bv,
+        other=-float("inf"),
+        cache_modifier=".cg",
+    )
+    logits_native = (projected + base_block).to(input_dtype)
+    # 验证端对这份 logits 做 softmax 得到 q，采样必须基于同一份存储精度的数，
+    # 否则被抽中的 token 与 q(x) 来自两份不同的分布。
+    tl.store(
+        logits_ptr
+        + offs_b[:, None] * stride_logits_b
+        + offs_v[None, :] * stride_logits_v,
+        logits_native,
+        mask=mask_bv,
+    )
+    logits = logits_native.to(tl.float32)
+
+    # argmax_i p_i / E_i（E ~ Exp(1)）即按 Categorical(p) 抽样；取 log 后 softmax
+    # 的归一化常数沿行恒定，退化为 argmax(logit / T - log E)。greedy 行直接
+    # argmax 原 logits，与 eager 中 noise 置 1 的处理等价。
+    temperatures = tl.load(temperatures_ptr + offs_b, mask=mask_b, other=1.0)
+    greedy = tl.load(greedy_mask_ptr + offs_b, mask=mask_b, other=1) != 0
+    noise = tl.load(
+        exp_noise_ptr
+        + offs_b[:, None] * stride_noise_b
+        + offs_v[None, :] * stride_noise_v,
+        mask=mask_bv,
+        other=1.0,
+        cache_modifier=".cg",
+    )
+    sampled_key = logits / temperatures[:, None] - tl.log(noise)
+    key = tl.where(greedy[:, None], logits, sampled_key)
+    key = tl.where(mask_v[None, :], key, -float("inf"))
+
+    local_max_val = tl.max(key, axis=1)
+    local_max_idx = tl.min(
+        tl.where(mask_v[None, :] & (key == local_max_val[:, None]), offs_v[None, :], V),
+        axis=1,
+    )
+
+    tl.store(
+        out_val_ptr + offs_b * stride_outv_b + pid_v * stride_outv_n,
+        local_max_val, mask=mask_b,
+    )
+    tl.store(
+        out_idx_ptr + offs_b * stride_outi_b + pid_v * stride_outi_n,
+        local_max_idx, mask=mask_b,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Kernel 2: Fused RNN cell (gate computation + state update)
 # ---------------------------------------------------------------------------
 
@@ -306,6 +423,86 @@ def fused_markov_bias_argmax(
         latent.stride(0), latent.stride(1),
         fc2_weight.stride(0), fc2_weight.stride(1),
         base_logits.stride(0), base_logits.stride(1),
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        BLOCK_B=block_b,
+        BLOCK_V=block_v,
+        BLOCK_R=block_r,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    _dspark_reduce_argmax_kernel[(B,)](
+        out_val, out_idx, final_token,
+        num_v_blocks,
+        out_val.stride(0), out_val.stride(1),
+        out_idx.stride(0), out_idx.stride(1),
+        final_token.stride(0),
+        BLOCK_N=512,
+        num_warps=1,
+    )
+
+
+def fused_markov_bias_sample(
+    *,
+    latent: torch.Tensor,            # [B, R] materialized latent
+    fc2_weight: torch.Tensor,        # [V, R] markov_w2.weight
+    base_logits: torch.Tensor,       # [B, V]
+    logits_out: torch.Tensor,        # [B, V] destination, base_logits dtype
+    temperatures: torch.Tensor,      # [B] fp32, clamped > 0
+    greedy_mask: torch.Tensor,       # [B] int32, nonzero -> argmax row
+    exp_noise: torch.Tensor,         # [B, V] fp32 Exp(1)
+    out_val: torch.Tensor,           # [B, num_v_blocks] fp32 scratch
+    out_idx: torch.Tensor,           # [B, num_v_blocks] int32 scratch
+    final_token: torch.Tensor,       # [B] int64 destination
+    block_v: int = MARKOV_BLOCK_V,
+    block_r: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 3,
+) -> None:
+    """Fused: ``latent @ fc2_weight.T + base_logits`` -> store logits -> sample.
+
+    Sampled counterpart of ``fused_markov_bias_argmax`` for the rejection
+    sampling path: the corrected logit row is written to ``logits_out`` (the
+    verifier needs q), and the token is drawn by exponential race against the
+    same stored values, per-row temperature, with greedy rows argmax'd. The
+    chain linear -> add -> softmax -> noise divide -> argmax collapses into one
+    full-vocab pass plus the shared tile reduce.
+
+    ``exp_noise`` is generated by the caller (``Tensor.exponential_``), same
+    trade-off as ``domino_kernels.fused_silu_fc2_sample``. ``logits_out`` may
+    alias ``base_logits``: every tile loads its base block before storing the
+    corrected block to the same addresses.
+    """
+    B = base_logits.shape[0]
+    V = base_logits.shape[1]
+    R = fc2_weight.shape[1]
+    if temperatures.dtype != torch.float32 or greedy_mask.dtype != torch.int32:
+        raise ValueError(
+            "fused_markov_bias_sample expects fp32 temperatures and int32 "
+            f"greedy_mask, got {temperatures.dtype} / {greedy_mask.dtype}."
+        )
+    if exp_noise.dtype != torch.float32 or logits_out.dtype != base_logits.dtype:
+        raise ValueError(
+            "fused_markov_bias_sample expects fp32 exp_noise and logits_out in "
+            f"the base_logits dtype, got {exp_noise.dtype} / {logits_out.dtype}."
+        )
+    num_v_blocks = (V + block_v - 1) // block_v
+    block_b = _score_block_b(B)
+
+    # dim0 必须是批维，见 argmax kernel 内的 L2 复用说明。
+    grid_main = ((B + block_b - 1) // block_b, num_v_blocks)
+    _dspark_fused_markov_bias_sample_kernel[grid_main](
+        latent,
+        fc2_weight, base_logits,
+        logits_out,
+        temperatures, greedy_mask, exp_noise,
+        out_val, out_idx,
+        B, R, V,
+        latent.stride(0), latent.stride(1),
+        fc2_weight.stride(0), fc2_weight.stride(1),
+        base_logits.stride(0), base_logits.stride(1),
+        logits_out.stride(0), logits_out.stride(1),
+        exp_noise.stride(0), exp_noise.stride(1),
         out_val.stride(0), out_val.stride(1),
         out_idx.stride(0), out_idx.stride(1),
         BLOCK_B=block_b,

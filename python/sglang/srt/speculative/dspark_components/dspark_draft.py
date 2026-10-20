@@ -18,6 +18,9 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.dspark_components.dspark_sampled_draft_graph import (
+    SampledDraftGraphRunner,
+)
 from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
     SampleStepTokens,
 )
@@ -214,6 +217,7 @@ def sample_draft_block(
     markov_head,
     device: torch.device,
     draft_temperature: Optional[float] = None,
+    sampled_graph: Optional[SampledDraftGraphRunner] = None,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     deterministic_draft = draft_temperature == 0
@@ -239,6 +243,25 @@ def sample_draft_block(
         temperatures = (
             sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
         )
+
+    if sampled_graph is not None and any_sampling and fast_sampling:
+        # Same rollout as the fast-sampling eager loop below, replayed from a
+        # CUDA graph; None means this batch is not covered, so fall through.
+        graph_out = sampled_graph.run(
+            base_logits=base_logits,
+            anchor_tokens=anchor_tokens,
+            temperatures=temperatures,
+            greedy_mask=greedy_mask,
+        )
+        if graph_out is not None:
+            draft_tokens, corrected_logits = graph_out
+            return DraftBlockResult(
+                draft_tokens=draft_tokens,
+                corrected_logits=corrected_logits,
+                greedy_mask=greedy_mask,
+                temperatures=temperatures,
+                deterministic_draft=deterministic_draft,
+            )
 
     if not any_sampling:
 
@@ -299,6 +322,7 @@ class DraftBlockProposer:
         self._mask_token_id = mask_token_id
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
+        self._sampled_graph: Optional[SampledDraftGraphRunner] = None
         self._dp_moe_sync = dp_moe_sync
         self._draft_temperature = draft_temperature
         self._segment_fn: Optional[Callable[[str], ContextManager[None]]] = None
@@ -306,6 +330,11 @@ class DraftBlockProposer:
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
+
+    def attach_sampled_graph(
+        self, sampled_graph: Optional[SampledDraftGraphRunner]
+    ) -> None:
+        self._sampled_graph = sampled_graph
 
     def attach_segment_fn(
         self,
@@ -406,6 +435,7 @@ class DraftBlockProposer:
                     markov_head=self.draft_model.markov_head,
                     device=device,
                     draft_temperature=self._draft_temperature,
+                    sampled_graph=self._sampled_graph,
                 )
         return DraftProposal(
             draft_block_ids=draft_block_ids,
