@@ -25,7 +25,6 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
     AcceptSampling,
     FinalizeAcceptLens,
     SelectMixedAccept,
-    SoftmaxTemp,
     accept_greedy_triton,
     finalize_accept_lens_triton,
 )
@@ -689,17 +688,16 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
-    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-    draft_probs = SoftmaxTemp.execute(
-        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-        temperatures=draft_block.temperatures,
-        rows_per_request=gamma_rows,
-    ).view(bs, gamma_rows, vocab)
+    # q 由拒绝采样 kernel 从草稿 logits 现算，不落稠密 fp32 probs
+    draft_logits = draft_block.corrected_logits
+    draft_temperatures = draft_block.temperatures
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(
             candidates=candidates,
             target_logits=target_logits,
-            draft_probs=draft_probs,
+            draft_probs=None,
+            draft_logits=draft_logits,
+            draft_temperatures=draft_temperatures,
             sampling_info=sampling_info,
             draft_input=draft_input,
             gamma=gamma,
@@ -715,7 +713,9 @@ def accept_draft_tokens(
     sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
         candidates=candidates,
         target_logits=target_logits,
-        draft_probs=draft_probs,
+        draft_probs=None,
+        draft_logits=draft_logits,
+        draft_temperatures=draft_temperatures,
         sampling_info=sampling_info,
         draft_input=draft_input,
         gamma=gamma,

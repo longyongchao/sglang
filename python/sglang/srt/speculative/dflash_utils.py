@@ -890,17 +890,14 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     )
     if draft_logits is not None:
         from sglang.srt.speculative.reject_sampling import (
-            chain_speculative_sampling_from_draft_logits_triton,
+            chain_speculative_sampling_fused_triton,
         )
 
         # draft_logits: [bs, num_draft, draft_vocab]，第 r 行是 slot_{r+1} 的 q，
         # 对应 kernel 在 step=r+1 读的 cur_prob_row=r。q 在 kernel 里按
         # softmax(draft_logits / draft_temperature) 现算并平移到 draft_vocab_start，
         # 不再落 [bs, draft_token_num, vocab] 的 fp32 稠密 q。
-        draft_inv_temperature = (
-            1.0 / draft_temperature if draft_temperature > 0 else 1.0
-        )
-        chain_speculative_sampling_from_draft_logits_triton(
+        chain_speculative_sampling_fused_triton(
             predicts=predicts,
             accept_index=accept_index,
             accept_token_num=accept_token_num,
@@ -911,7 +908,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             target_probs=target_probs,
             draft_logits=draft_logits,
             draft_vocab_start=int(draft_vocab_start),
-            draft_inv_temperature=draft_inv_temperature,
+            draft_temperature=draft_temperature if draft_temperature > 0 else 1.0,
         )
     else:
         tree_speculative_sampling_target_only(

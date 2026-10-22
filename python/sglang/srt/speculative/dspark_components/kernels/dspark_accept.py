@@ -16,7 +16,10 @@ from sglang.srt.speculative.dflash_utils import (
     tree_speculative_sampling_target_only,
 )
 from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
-from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
+from sglang.srt.speculative.reject_sampling import (
+    chain_speculative_sampling_fused_triton,
+    chain_speculative_sampling_triton,
+)
 
 
 class AcceptSampling:
@@ -40,6 +43,8 @@ class AcceptSampling:
         gamma: int,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        draft_logits: Optional[torch.Tensor] = None,
+        draft_temperatures: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling(
             candidates=candidates,
@@ -50,6 +55,8 @@ class AcceptSampling:
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            draft_logits=draft_logits,
+            draft_temperatures=draft_temperatures,
         )
 
     @classmethod
@@ -64,6 +71,8 @@ class AcceptSampling:
         gamma: int,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        draft_logits: Optional[torch.Tensor] = None,
+        draft_temperatures: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling_triton(
             candidates=candidates,
@@ -74,6 +83,8 @@ class AcceptSampling:
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            draft_logits=draft_logits,
+            draft_temperatures=draft_temperatures,
         )
 
 
@@ -87,24 +98,11 @@ def _accept_sampling_core(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
+    draft_logits: Optional[torch.Tensor] = None,
+    draft_temperatures: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
-        target_probs = SoftmaxTemp.execute(
-            logits=target_logits,
-            temperatures=sampling_info.temperatures,
-            rows_per_request=verify_num_draft_tokens,
-        ).view(bs, verify_num_draft_tokens, -1)
-    else:
-        target_probs = build_dflash_verify_target_probs(
-            next_token_logits=target_logits,
-            sampling_info=sampling_info,
-            draft_token_num=verify_num_draft_tokens,
-            bs=bs,
-            max_top_k=draft_input.max_top_k,
-            uniform_top_k_value=draft_input.uniform_top_k_value,
-        )
     (
         retrieve_index,
         retrieve_next_token,
@@ -119,44 +117,96 @@ def _accept_sampling_core(
     )
     uniform_samples = torch.rand((bs, verify_num_draft_tokens), dtype=torch.float32, device=device)
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
-    sampling_fn = (
-        tree_speculative_sampling_target_only
-        if draft_probs is None
-        else chain_speculative_sampling_triton
-    )
-    if sampling_fn is None:
-        raise RuntimeError(
-            "Target-only speculative sampling requires the sgl-kernel sampling ops."
-        )
-    sampling_draft_probs = (
-        _get_or_create_zero_draft_probs(
-            bs=bs,
-            draft_token_num=verify_num_draft_tokens,
-            vocab=target_probs.shape[-1],
-            device=device,
-        )
-        if draft_probs is None
-        else draft_probs
-    )
     candidates_i64 = (
         candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
     )
-    sampling_fn(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_final,
-        target_probs=target_probs,
-        draft_probs=sampling_draft_probs,
-        threshold_single=1.0,
-        threshold_acc=1.0,
-        deterministic=True,
+    plain_target = (
+        not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling
     )
+
+    if draft_logits is not None and draft_probs is None:
+        # chain 拒绝采样直接读 logits：不带 top-k/top-p 时 p 也由 kernel 按
+        # softmax(l / T) 现算，省掉稠密 fp32 target/draft probs 的写出与读回，
+        # 以及 flashinfer softmax 之前那份 .to(fp32) 的 logits 副本。
+        if plain_target:
+            target_kwargs = dict(
+                target_logits=target_logits.view(bs, verify_num_draft_tokens, -1),
+                target_temperature=sampling_info.temperatures,
+            )
+        else:
+            target_kwargs = dict(
+                target_probs=build_dflash_verify_target_probs(
+                    next_token_logits=target_logits,
+                    sampling_info=sampling_info,
+                    draft_token_num=verify_num_draft_tokens,
+                    bs=bs,
+                    max_top_k=draft_input.max_top_k,
+                    uniform_top_k_value=draft_input.uniform_top_k_value,
+                )
+            )
+        chain_speculative_sampling_fused_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrive_index=retrieve_index,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_final,
+            draft_logits=draft_logits,
+            draft_temperature=draft_temperatures,
+            **target_kwargs,
+        )
+    else:
+        if plain_target:
+            target_probs = SoftmaxTemp.execute(
+                logits=target_logits,
+                temperatures=sampling_info.temperatures,
+                rows_per_request=verify_num_draft_tokens,
+            ).view(bs, verify_num_draft_tokens, -1)
+        else:
+            target_probs = build_dflash_verify_target_probs(
+                next_token_logits=target_logits,
+                sampling_info=sampling_info,
+                draft_token_num=verify_num_draft_tokens,
+                bs=bs,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
+        sampling_fn = (
+            tree_speculative_sampling_target_only
+            if draft_probs is None
+            else chain_speculative_sampling_triton
+        )
+        if sampling_fn is None:
+            raise RuntimeError(
+                "Target-only speculative sampling requires the sgl-kernel sampling ops."
+            )
+        sampling_draft_probs = (
+            _get_or_create_zero_draft_probs(
+                bs=bs,
+                draft_token_num=verify_num_draft_tokens,
+                vocab=target_probs.shape[-1],
+                device=device,
+            )
+            if draft_probs is None
+            else draft_probs
+        )
+        sampling_fn(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_final,
+            target_probs=target_probs,
+            draft_probs=sampling_draft_probs,
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=True,
+        )
     correct_len = accept_token_num
     if cutoff_verify_lens is not None:
         correct_len, cap_trim_lens = CapCorrectLen.execute(
@@ -177,6 +227,8 @@ def accept_sampling(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    draft_logits: Optional[torch.Tensor] = None,
+    draft_temperatures: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -189,6 +241,8 @@ def accept_sampling(
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        draft_logits=draft_logits,
+        draft_temperatures=draft_temperatures,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
@@ -245,6 +299,8 @@ def accept_sampling_triton(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    draft_logits: Optional[torch.Tensor] = None,
+    draft_temperatures: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
         candidates=candidates,
@@ -255,6 +311,8 @@ def accept_sampling_triton(
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        draft_logits=draft_logits,
+        draft_temperatures=draft_temperatures,
     )
     bonus = gather_two_level_bonus_triton(
         accept_index=accept_index, predicts=predicts, correct_len=correct_len
