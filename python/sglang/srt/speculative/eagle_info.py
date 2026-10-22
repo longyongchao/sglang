@@ -45,9 +45,12 @@ class EagleVerifyInput(SpecInput):
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
     # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
-    # vocab); only set for classic actual-q rejection sampling. Official
+    # q_vocab); only set for classic actual-q rejection sampling. Official
     # EAGLE3 verification intentionally leaves this field None.
     draft_probs: torch.Tensor = None
+    # int32 [target_vocab]: target token -> column of draft_probs (-1 = q 0).
+    # Set when the draft head vocab is reduced (d2t); shared across the batch.
+    draft_vocab_map: torch.Tensor = None
     use_eagle3_rejection_sampling: bool = False
 
     # Shape info for padding

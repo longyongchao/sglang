@@ -68,30 +68,40 @@ def _load_prob(
     vocab_start,
     vocab_len,
     num_rows,
+    VocabMap,
     FROM_LOGITS: tl.constexpr,
     PER_REQ_TEMP: tl.constexpr,
+    MAPPED: tl.constexpr = False,
 ):
     """读一份分布在 ``[pid, row, v_offsets]`` 处的概率。
 
     ``FROM_LOGITS`` 时 ``Ptr`` 是 logits ``[bs, rows, n]``，第 ``j`` 列对应词表下标
     ``vocab_start + j``；概率现算为 ``exp(l / T - lse)``，词表区间外和
-    ``row >= num_rows`` 都视作 0。否则 ``Ptr`` 就是稠密概率。
+    ``row >= num_rows`` 都视作 0。``MAPPED`` 时第 ``j`` 列改由
+    ``VocabMap[token] == j`` 决定（``-1`` 表示该 token 不在草稿词表，概率为 0），
+    稠密概率与 logits 都适用。两者皆否时 ``Ptr`` 就是全词表稠密概率。
     """
-    if FROM_LOGITS:
-        local = v_offsets - vocab_start
-        in_range = v_mask & (local >= 0) & (local < vocab_len) & (row < num_rows)
+    if FROM_LOGITS or MAPPED:
+        if MAPPED:
+            local = tl.load(VocabMap + v_offsets, mask=v_mask, other=-1)
+            in_range = v_mask & (local >= 0) & (row < num_rows)
+        else:
+            local = v_offsets - vocab_start
+            in_range = v_mask & (local >= 0) & (local < vocab_len) & (row < num_rows)
         safe_row = tl.minimum(row, num_rows - 1)
-        l_val = tl.load(
+        val = tl.load(
             Ptr + pid.to(tl.int64) * stride_b + safe_row * stride_s + local * stride_v,
             mask=in_range,
             other=0.0,
         ).to(tl.float32)
+        if not FROM_LOGITS:
+            return tl.where(in_range, val, 0.0)
         lse = tl.load(Lse + pid * stride_lse_b + safe_row * stride_lse_s)
         if PER_REQ_TEMP:
             temp = tl.load(Temperatures + pid).to(tl.float32)
         else:
             temp = temperature
-        return tl.where(in_range, tl.exp(l_val / temp - lse), 0.0)
+        return tl.where(in_range, tl.exp(val / temp - lse), 0.0)
     else:
         return tl.load(
             Ptr + pid * stride_b + row * stride_s + v_offsets * stride_v,
@@ -140,6 +150,8 @@ def speculative_sampling_classic_kernel(
     q_vocab_start,
     q_vocab_len,
     num_q_rows,
+    # Q_MAPPED 时 q 的列按 DraftVocabMap[target token] 取（-1 为 q=0）
+    DraftVocabMap,
     # HAS_GATE 时 Gate[0] == 0 整个 kernel 直接返回，不写任何输出
     Gate,
     # Constants
@@ -151,6 +163,7 @@ def speculative_sampling_classic_kernel(
     Q_FROM_LOGITS: tl.constexpr = False,
     Q_PER_REQ_TEMP: tl.constexpr = False,
     HAS_GATE: tl.constexpr = False,
+    Q_MAPPED: tl.constexpr = False,
 ):
     if HAS_GATE:
         if tl.load(Gate) == 0:
@@ -180,13 +193,14 @@ def speculative_sampling_classic_kernel(
             TargetProbs, TargetLse, TargetTemps, pid, cur_prob_row,
             draft_token, tok_valid, stride_tp_b, stride_tp_s, stride_tp_v,
             stride_tlse_b, stride_tlse_s, target_temperature,
-            0, VOCAB_SIZE, NUM_SLOTS, P_FROM_LOGITS, P_PER_REQ_TEMP,
+            0, VOCAB_SIZE, NUM_SLOTS, DraftVocabMap, P_FROM_LOGITS, P_PER_REQ_TEMP,
         )  # fmt: skip
         q = _load_prob(
             DraftProbs, DraftLse, DraftTemps, pid, cur_prob_row,
             draft_token, tok_valid, stride_dp_b, stride_dp_s, stride_dp_v,
             stride_dlse_b, stride_dlse_s, draft_temperature,
-            q_vocab_start, q_vocab_len, num_q_rows, Q_FROM_LOGITS, Q_PER_REQ_TEMP,
+            q_vocab_start, q_vocab_len, num_q_rows, DraftVocabMap, Q_FROM_LOGITS,
+            Q_PER_REQ_TEMP, Q_MAPPED,
         )  # fmt: skip
 
         coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
@@ -228,7 +242,7 @@ def speculative_sampling_classic_kernel(
             TargetProbs, TargetLse, TargetTemps, pid, cur_prob_row,
             v_offsets, mask, stride_tp_b, stride_tp_s, stride_tp_v,
             stride_tlse_b, stride_tlse_s, target_temperature,
-            0, VOCAB_SIZE, NUM_SLOTS, P_FROM_LOGITS, P_PER_REQ_TEMP,
+            0, VOCAB_SIZE, NUM_SLOTS, DraftVocabMap, P_FROM_LOGITS, P_PER_REQ_TEMP,
         )  # fmt: skip
 
         if all_drafts_accepted:
@@ -238,7 +252,8 @@ def speculative_sampling_classic_kernel(
                 DraftProbs, DraftLse, DraftTemps, pid, cur_prob_row,
                 v_offsets, mask, stride_dp_b, stride_dp_s, stride_dp_v,
                 stride_dlse_b, stride_dlse_s, draft_temperature,
-                q_vocab_start, q_vocab_len, num_q_rows, Q_FROM_LOGITS, Q_PER_REQ_TEMP,
+                q_vocab_start, q_vocab_len, num_q_rows, DraftVocabMap, Q_FROM_LOGITS,
+                Q_PER_REQ_TEMP, Q_MAPPED,
             )  # fmt: skip
             diff = p_val - q_val
             val = tl.where(diff > 0.0, diff, 0.0)
@@ -262,7 +277,7 @@ def speculative_sampling_classic_kernel(
                 TargetProbs, TargetLse, TargetTemps, pid, cur_prob_row,
                 v_offsets, mask, stride_tp_b, stride_tp_s, stride_tp_v,
                 stride_tlse_b, stride_tlse_s, target_temperature,
-                0, VOCAB_SIZE, NUM_SLOTS, P_FROM_LOGITS, P_PER_REQ_TEMP,
+                0, VOCAB_SIZE, NUM_SLOTS, DraftVocabMap, P_FROM_LOGITS, P_PER_REQ_TEMP,
             )  # fmt: skip
 
             if all_drafts_accepted:
@@ -272,7 +287,8 @@ def speculative_sampling_classic_kernel(
                     DraftProbs, DraftLse, DraftTemps, pid, cur_prob_row,
                     v_offsets, mask, stride_dp_b, stride_dp_s, stride_dp_v,
                     stride_dlse_b, stride_dlse_s, draft_temperature,
-                    q_vocab_start, q_vocab_len, num_q_rows, Q_FROM_LOGITS, Q_PER_REQ_TEMP,
+                    q_vocab_start, q_vocab_len, num_q_rows, DraftVocabMap, Q_FROM_LOGITS,
+                    Q_PER_REQ_TEMP, Q_MAPPED,
                 )  # fmt: skip
                 diff = p_val - q_val
                 val = tl.where(diff > 0.0, diff, 0.0)
@@ -355,6 +371,7 @@ def chain_speculative_sampling_fused_triton(
     draft_vocab_start: int = 0,
     draft_temperature: TemperatureArg = 1.0,
     gate: Optional[torch.Tensor] = None,
+    draft_vocab_map: Optional[torch.Tensor] = None,
 ):
     """chain 拒绝采样；p、q 各自既可给稠密概率，也可给 logits 由 kernel 现算。
 
@@ -363,6 +380,10 @@ def chain_speculative_sampling_fused_triton(
     - ``draft_logits`` ``[bs, rows, draft_vocab]``：
       ``q[b, r, draft_vocab_start + j] = softmax(l[b, r] / T_draft)[j]``，区间外为 0；
       ``rows`` 不足 ``num_slots - 1`` 时缺的行按 q=0 处理。
+    - ``draft_vocab_map`` int32 ``[vocab]``：草稿只覆盖一个非连续子词表（EAGLE3
+      d2t）时，``q[b, r, x] = q_src[b, r, draft_vocab_map[x]]``，``-1`` 处为 0。
+      此时 ``draft_probs`` / ``draft_logits`` 保持草稿词表宽度，不必先 scatter 到
+      全词表；与 ``draft_vocab_start`` 互斥。
     温度可为标量或 per-request ``[bs]`` 张量。
     ``gate``（device 上 int32 ``[1]``）为 0 时所有 kernel 跳过、输出不写，供 cuda
     graph 内按批次开关拒绝采样。
@@ -384,6 +405,16 @@ def chain_speculative_sampling_fused_triton(
         t_lse, t_temps, t_temp, t_per_req = p_src, p_src, 1.0, False
 
     q_from_logits = draft_logits is not None
+    q_mapped = draft_vocab_map is not None
+    if q_mapped:
+        if draft_vocab_start != 0:
+            raise ValueError("draft_vocab_map and draft_vocab_start are exclusive")
+        if draft_vocab_map.shape != (vocab_size,) or draft_vocab_map.dtype != torch.int32:
+            raise ValueError(
+                f"draft_vocab_map must be int32 [{vocab_size}], got "
+                f"{draft_vocab_map.dtype} {tuple(draft_vocab_map.shape)}"
+            )
+        q_src = _as_rows_last_contiguous(q_src)
     if q_from_logits:
         num_q_rows, draft_vocab = q_src.shape[1], q_src.shape[2]
         q_vocab_len = max(
@@ -392,7 +423,8 @@ def chain_speculative_sampling_fused_triton(
         d_lse = row_logsumexp(q_src, draft_temperature, gate)
         d_temps, d_temp, d_per_req = _temperature_args(draft_temperature, batch_size, d_lse)
     else:
-        num_q_rows, q_vocab_len = 0, 0
+        num_q_rows = q_src.shape[1] if q_mapped else 0
+        q_vocab_len = 0
         d_lse, d_temps, d_temp, d_per_req = q_src, q_src, 1.0, False
 
     speculative_sampling_classic_kernel[(batch_size,)](
@@ -430,6 +462,7 @@ def chain_speculative_sampling_fused_triton(
         int(draft_vocab_start),
         int(q_vocab_len),
         int(num_q_rows),
+        draft_vocab_map if q_mapped else accept_token_num,
         accept_token_num if gate is None else gate,
         NUM_SLOTS=num_slots,
         VOCAB_SIZE=vocab_size,
@@ -439,6 +472,7 @@ def chain_speculative_sampling_fused_triton(
         Q_FROM_LOGITS=q_from_logits,
         Q_PER_REQ_TEMP=d_per_req,
         HAS_GATE=gate is not None,
+        Q_MAPPED=q_mapped,
     )
 
 
@@ -457,6 +491,7 @@ def chain_speculative_sampling_triton(
     threshold_single,
     threshold_acc,
     deterministic,  # not used
+    draft_vocab_map=None,
 ):
     chain_speculative_sampling_fused_triton(
         predicts=predicts,
@@ -468,4 +503,5 @@ def chain_speculative_sampling_triton(
         uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
         target_probs=target_probs,
         draft_probs=draft_probs,
+        draft_vocab_map=draft_vocab_map,
     )

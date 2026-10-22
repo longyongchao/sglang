@@ -193,6 +193,26 @@ def scatter_draft_probs_to_target_vocab(
     return out
 
 
+def build_draft_vocab_map(
+    hot_token_id: torch.Tensor, target_vocab_size: int
+) -> torch.Tensor:
+    """Inverse of ``hot_token_id``: target token id -> draft column, ``-1`` if absent.
+
+    Lets the chain RS kernel read a draft-wide ``q`` directly (``q(x) = 0`` for
+    non-hot ``x``, same as :func:`scatter_draft_probs_to_target_vocab`) instead
+    of materializing a full-vocab fp32 copy every verify step.
+    """
+    vocab_map = torch.full(
+        (target_vocab_size,), -1, dtype=torch.int32, device=hot_token_id.device
+    )
+    vocab_map.index_copy_(
+        0,
+        hot_token_id.long(),
+        torch.arange(hot_token_id.numel(), dtype=torch.int32, device=hot_token_id.device),
+    )
+    return vocab_map
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()

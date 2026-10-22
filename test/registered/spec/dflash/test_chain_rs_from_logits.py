@@ -252,5 +252,75 @@ class TestDSparkAcceptSamplingFromLogits(CustomTestCase):
                 )
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required for Triton kernels")
+class TestChainRSDraftVocabMap(CustomTestCase):
+    """EAGLE3 d2t：草稿宽度 q 经 draft_vocab_map 在 kernel 内取列，与先 scatter
+    到全词表 fp32 q 的老路径逐位一致。"""
+
+    def test_mapped_q_matches_scattered(self):
+        from sglang.srt.speculative.spec_utils import (
+            build_draft_vocab_map,
+            scatter_draft_probs_to_target_vocab,
+        )
+
+        bs, num_slots, vocab, draft_vocab = 48, 5, 9000, 2000
+        g = torch.Generator(device=DEVICE).manual_seed(21)
+        hot = torch.randperm(vocab, generator=g, device=DEVICE)[:draft_vocab]
+        vocab_map = build_draft_vocab_map(hot, vocab)
+        draft_logits = torch.randn(
+            bs, num_slots - 1, draft_vocab, generator=g, device=DEVICE
+        ).mul_(3.0)
+        q_draft = torch.softmax(draft_logits, dim=-1)
+        q_full = scatter_draft_probs_to_target_vocab(q_draft, hot, vocab)
+        target_logits = torch.randn(bs, num_slots, vocab, generator=g, device=DEVICE)
+        target_logits[:, : num_slots - 1, hot] += draft_logits
+        target_probs = torch.softmax(target_logits, dim=-1).contiguous()
+        candidates = torch.zeros(bs, num_slots, dtype=torch.int64, device=DEVICE)
+        for k in range(1, num_slots):
+            candidates[:, k] = torch.multinomial(q_full[:, k - 1], 1, generator=g)[:, 0]
+        retrieve_index = torch.arange(bs * num_slots, device=DEVICE).view(
+            bs, num_slots
+        )
+        coins = torch.rand(bs, num_slots, generator=g, device=DEVICE)
+        final_coins = torch.rand(bs, generator=g, device=DEVICE)
+        common = dict(
+            candidates=candidates, retrive_index=retrieve_index,
+            uniform_samples=coins, uniform_samples_for_final_sampling=final_coins,
+            target_probs=target_probs,
+        )  # fmt: skip
+
+        ref = _buffers(bs, num_slots)
+        chain_speculative_sampling_fused_triton(
+            predicts=ref[0], accept_index=ref[1], accept_token_num=ref[2],
+            draft_probs=q_full, **common,
+        )  # fmt: skip
+        variants = (
+            dict(draft_probs=q_draft),
+            dict(draft_logits=draft_logits.bfloat16().float()),
+        )
+        for kw in variants:
+            if "draft_logits" in kw:
+                # logits 变体：参考 q 改用同一份 logits 现算的 softmax
+                q_ref = scatter_draft_probs_to_target_vocab(
+                    torch.softmax(kw["draft_logits"], dim=-1), hot, vocab
+                )
+                ref = _buffers(bs, num_slots)
+                chain_speculative_sampling_fused_triton(
+                    predicts=ref[0], accept_index=ref[1], accept_token_num=ref[2],
+                    draft_probs=q_ref, **common,
+                )  # fmt: skip
+            out = _buffers(bs, num_slots)
+            chain_speculative_sampling_fused_triton(
+                predicts=out[0], accept_index=out[1], accept_token_num=out[2],
+                draft_vocab_map=vocab_map, **kw, **common,
+            )  # fmt: skip
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(out[2], ref[2]), (out[2], ref[2]))
+            self.assertTrue(torch.equal(out[1], ref[1]))
+            self.assertTrue(torch.equal(out[0], ref[0]))
+        correct = ref[2]
+        self.assertTrue((correct == num_slots - 1).any() and (correct < num_slots - 1).any())
+
+
 if __name__ == "__main__":
     unittest.main()

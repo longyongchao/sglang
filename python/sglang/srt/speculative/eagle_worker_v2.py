@@ -77,6 +77,7 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_pq_recorder import create_spec_pq_recorder
 from sglang.srt.speculative.spec_utils import (
+    build_draft_vocab_map,
     commit_mamba_states_after_verify,
     draft_tp_context,
     fast_sample,
@@ -282,14 +283,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 "vocabularies, or a d2t token map to lift the draft proposal "
                 "distribution into the target vocabulary."
             )
-        # q is carried in the draft vocabulary and only scattered into the target
-        # vocabulary at the verify-kernel boundary (see
-        # _build_verify_draft_probs), so every q-shaped buffer -- including the
-        # draft cuda-graph buffer and the overlap FutureMap -- is draft-wide.
+        # q is carried in the draft vocabulary end to end: the chain RS kernel
+        # reads it through draft_vocab_map (target token -> draft column, -1 =
+        # q 0), so every q-shaped buffer -- including the draft cuda-graph buffer
+        # and the overlap FutureMap -- is draft-wide and no full-vocab fp32 copy
+        # is materialized per verify step.
         self.q_vocab_size = (
             draft_vocab_size
             if self.hot_token_id is not None
             else self.target_vocab_size
+        )
+        self.draft_vocab_map = (
+            build_draft_vocab_map(self.hot_token_id, self.target_vocab_size)
+            if self.use_classic_rejection_sampling and self.hot_token_id is not None
+            else None
         )
 
     def init_attention_backends(self):
@@ -662,6 +669,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             seq_lens_sum=None,
             seq_lens_cpu=None,
             draft_probs=draft_probs,
+            draft_vocab_map=self.draft_vocab_map,
             use_eagle3_rejection_sampling=self.use_eagle3_rejection_sampling,
         )
 
@@ -828,9 +836,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         slot i + 1 was sampled from; the chain kernel reads row `step - 1` when
         verifying slot `step`, so the list order must not be disturbed.
 
-        The chain kernel indexes q by target token id, so a reduced draft
-        vocabulary is scattered into the target vocabulary here -- once, at the
-        kernel boundary, instead of on every producer.
+        q stays in the draft vocabulary; with a reduced draft vocabulary the
+        chain kernel looks q up through ``self.draft_vocab_map``.
         """
         if self.topk != 1:
             raise ValueError(
@@ -838,22 +845,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"got {self.topk}. The tree topology has no single q per slot."
             )
         draft_probs = torch.stack(draft_probs_list, dim=1)
-        if self.hot_token_id is not None:
-            draft_probs = scatter_draft_probs_to_target_vocab(
-                draft_probs, self.hot_token_id, self.target_vocab_size
-            )
         # Every proposed token was drawn from its own row of q, so q > 0 there.
-        # A misaligned or mis-scattered q shows up as q == 0, which makes
+        # A misaligned or mis-mapped q shows up as q == 0, which makes
         # `coin * q < p` vacuously true: accept length pins to num_steps while
         # the text degrades. Gated so the gather never runs in production.
         if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            proposed_cols = draft_tokens.to(torch.int64)
+            if self.draft_vocab_map is not None:
+                proposed_cols = self.draft_vocab_map[proposed_cols].to(torch.int64)
             proposed_q = draft_probs.gather(
-                -1, draft_tokens.to(torch.int64).unsqueeze(-1)
-            )
+                -1, proposed_cols.clamp_min(0).unsqueeze(-1)
+            ).squeeze(-1)
             maybe_assert_async(
-                (proposed_q > 0).all(),
+                ((proposed_cols >= 0) & (proposed_q > 0)).all(),
                 "draft_forward: q == 0 on a proposed draft token; draft_probs rows "
-                "are misaligned with the chain slots or the d2t scatter is wrong",
+                "are misaligned with the chain slots or the d2t map is wrong",
             )
         return draft_probs
 
@@ -1738,6 +1744,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             num_slots = int(verify_input.draft_token_num)
             candidates = verify_input.draft_token.reshape(bs, num_slots)
             draft_probs = verify_input.draft_probs
+            if draft_probs is not None and verify_input.draft_vocab_map is not None:
+                # The recorder wants full-vocab q; lift only on this debug path.
+                draft_probs = scatter_draft_probs_to_target_vocab(
+                    draft_probs,
+                    self.draft_worker.hot_token_id,
+                    self.draft_worker.target_vocab_size,
+                )
             target_temperatures = (
                 batch.sampling_info.temperatures
                 if batch.sampling_info is not None

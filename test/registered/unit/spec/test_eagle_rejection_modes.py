@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_utils import (
+    build_draft_vocab_map,
     renorm_draft_probs,
     resolve_rejection_sampling_mode,
     scatter_draft_probs_to_target_vocab,
@@ -169,11 +170,17 @@ class TestEagleRejectionModes(CustomTestCase):
         worker.topk = topk
         worker.hot_token_id = hot_token_id
         worker.target_vocab_size = target_vocab
+        worker.draft_vocab_map = (
+            build_draft_vocab_map(hot_token_id, target_vocab)
+            if hot_token_id is not None
+            else None
+        )
         return worker
 
-    def test_build_verify_draft_probs_lifts_rows_in_order(self):
+    def test_build_verify_draft_probs_keeps_rows_in_order_draft_wide(self):
         """Row i must stay the distribution slot i + 1 was sampled from; the chain
-        kernel reads row `step - 1` when verifying slot `step`."""
+        kernel reads row `step - 1` when verifying slot `step`. q stays in the
+        draft vocab; the kernel reads it through draft_vocab_map."""
         worker = self._worker_for_verify_probs(
             topk=1, hot_token_id=torch.tensor([7, 1, 5, 3])
         )
@@ -185,10 +192,11 @@ class TestEagleRejectionModes(CustomTestCase):
 
         out = worker._build_verify_draft_probs(rows, draft_tokens)
 
-        self.assertEqual(out.shape, (1, 2, 8))
-        self.assertEqual(out[0, 0, 7].item(), 1.0)
-        self.assertEqual(out[0, 1, 3].item(), 1.0)
-        self.assertEqual(out[0, 0, 3].item(), 0.0)
+        self.assertEqual(out.shape, (1, 2, 4))
+        cols = worker.draft_vocab_map[draft_tokens].long()
+        self.assertEqual(out[0, 0, cols[0, 0]].item(), 1.0)
+        self.assertEqual(out[0, 1, cols[0, 1]].item(), 1.0)
+        self.assertEqual(out[0, 0, cols[0, 1]].item(), 0.0)
 
     def test_build_verify_draft_probs_without_token_map(self):
         worker = self._worker_for_verify_probs(
@@ -315,6 +323,16 @@ class TestScatterDraftProbsToTargetVocab(CustomTestCase):
         # Tokens 5 and 3 are hot but had zero draft mass, so p survives there.
         torch.testing.assert_close(residual[0, 0, 5], p[0, 0, 5])
         torch.testing.assert_close(residual[0, 0, 3], p[0, 0, 3])
+
+    def test_draft_vocab_map_inverts_mapping(self):
+        vocab_map = build_draft_vocab_map(self.MAPPING, 8)
+        self.assertEqual(vocab_map.dtype, torch.int32)
+        self.assertEqual(vocab_map.tolist(), [-1, 1, -1, 3, -1, 2, -1, 0])
+        draft_probs = torch.rand(2, 3, 4)
+        lifted = scatter_draft_probs_to_target_vocab(draft_probs, self.MAPPING, 8)
+        gathered = draft_probs[..., vocab_map.clamp_min(0).long()]
+        gathered = torch.where(vocab_map >= 0, gathered, 0.0)
+        torch.testing.assert_close(gathered, lifted)
 
 
 if __name__ == "__main__":

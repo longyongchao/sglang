@@ -520,14 +520,31 @@ def eagle_sample(
                 if use_rejection_sampling
                 else torch.zeros_like(target_probs)
             )
+            # A reduced-vocab EAGLE3 draft keeps q draft-wide; the chain kernel
+            # gathers it through draft_vocab_map instead of a full-vocab copy.
+            draft_vocab_map = (
+                verify_input.draft_vocab_map if use_rejection_sampling else None
+            )
+            # q must index the target vocab directly, or through the map.
             if use_rejection_sampling and (
-                draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+                draft_probs is None
+                or (
+                    draft_probs.shape[-1]
+                    if draft_vocab_map is None
+                    else draft_vocab_map.shape[0]
+                )
+                != target_probs.shape[-1]
             ):
                 raise ValueError(
                     "Rejection sampling requires a target-vocab draft proposal "
                     "distribution; the current speculative algorithm/draft worker "
                     "does not produce one (draft_probs missing or vocab-mismatched)."
                 )
+            extra_kwargs = (
+                {"draft_vocab_map": draft_vocab_map}
+                if draft_vocab_map is not None
+                else {}
+            )
             sampling_fn = (
                 chain_speculative_sampling_triton
                 if use_rejection_sampling
@@ -548,6 +565,7 @@ def eagle_sample(
                 threshold_single=get_global_server_args().speculative_accept_threshold_single,
                 threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
                 deterministic=True,
+                **extra_kwargs,
             )
 
         # Sync sampling results across TP ranks: different GPUs may
