@@ -105,3 +105,21 @@ def test_ineligible_model_reports_reason():
     model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)])
     helper, reason = build_fused_kv_helper(model, device="cuda", max_position_hint=16)
     assert helper is None and "layer=0" in reason
+
+
+def test_injector_builds_helper_before_kv_pool_exists():
+    # At DSpark worker init the draft runner has no token_to_kv_pool yet.
+    from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
+        TargetHiddenKvInjector,
+    )
+
+    model = _model(torch.bfloat16)
+    injector = TargetHiddenKvInjector(
+        draft_model=model,
+        draft_model_runner=SimpleNamespace(),
+        model_runner=SimpleNamespace(model_config=SimpleNamespace(context_len=512)),
+        device="cuda",
+        verify_num_draft_tokens=4,
+        block_pos_offsets=torch.arange(4, device="cuda"),
+    )
+    assert injector._fused_kv_helper is not None

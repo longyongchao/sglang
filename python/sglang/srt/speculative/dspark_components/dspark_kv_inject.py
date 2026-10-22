@@ -75,17 +75,18 @@ class TargetHiddenKvInjector:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
-        self._fused_kv_helper = None
-        pool = draft_model_runner.token_to_kv_pool
-        if not hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
-            self._fused_kv_helper, reason = build_fused_kv_helper(
-                draft_model,
-                device=device,
-                max_position_hint=int(model_runner.model_config.context_len)
-                + int(verify_num_draft_tokens),
-            )
-            if self._fused_kv_helper is None:
-                logger.info("DSpark fused KV inject disabled: %s", reason)
+        # The draft KV pool is not allocated yet at worker init, so eligibility
+        # is judged from the draft layers alone. The MLA (dsv4) draft has no
+        # ``layers`` and gets no helper; inject_target_hidden also routes MLA
+        # pools away before the helper would be used.
+        self._fused_kv_helper, reason = build_fused_kv_helper(
+            draft_model,
+            device=device,
+            max_position_hint=int(model_runner.model_config.context_len)
+            + int(verify_num_draft_tokens),
+        )
+        if self._fused_kv_helper is None:
+            logger.info("DSpark fused KV inject disabled: %s", reason)
 
     def inject_target_hidden(
         self,
