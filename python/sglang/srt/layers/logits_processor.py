@@ -858,22 +858,37 @@ class LogitsProcessor(nn.Module):
             hidden_states, logits_metadata
         )
 
-        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        if self._can_write_verify_logits_into_buffer(
+            hidden_states, lm_head, logits_metadata, embedding_bias
+        ):
+            # Target verify 的 cuda graph 每步要把 [bs * num_draft, vocab] 的
+            # 半精度 logits 再 cast 进 fp32 静态 buffer。让 GEMM 直接以 fp32 输出
+            # 写进 buffer，省掉一次全词表半精度写回 + 读出。cuBLAS 本就以 fp32
+            # 累加，差别只是 logits 不再先舍入到半精度。
+            logits = logits_metadata.next_token_logits_buffer
+            torch.mm(
+                hidden_states,
+                lm_head.weight[: self.vocab_size].T,
+                out_dtype=torch.float32,
+                out=logits,
+            )
+        else:
+            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
 
-        if self.logit_scale is not None:
-            logits.mul_(self.logit_scale)
+            if self.logit_scale is not None:
+                logits.mul_(self.logit_scale)
 
-        if self.do_tensor_parallel_all_gather:
-            if self.use_attn_tp_group:
-                logits = self._gather_attn_tp_logits(logits)
-            else:
-                logits = tensor_model_parallel_all_gather(logits)
+            if self.do_tensor_parallel_all_gather:
+                if self.use_attn_tp_group:
+                    logits = self._gather_attn_tp_logits(logits)
+                else:
+                    logits = tensor_model_parallel_all_gather(logits)
 
-        logits = self._scatter_dp_attn_logits(
-            logits, local_hidden_states, logits_metadata
-        )
+            logits = self._scatter_dp_attn_logits(
+                logits, local_hidden_states, logits_metadata
+            )
 
-        logits = self._copy_logits_to_buffer(logits, logits_metadata)
+            logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
         if self.final_logit_softcapping:
             if not _is_npu:
@@ -884,6 +899,49 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def _can_write_verify_logits_into_buffer(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        embedding_bias: Optional[torch.Tensor],
+    ) -> bool:
+        """Whether target-verify logits can be produced by one fp32-output GEMM.
+
+        Only the plain (unquantized, single-rank, unscaled) half-precision LM
+        head qualifies; every other path keeps the GEMM + cast-copy sequence.
+        """
+        logits_buffer = logits_metadata.next_token_logits_buffer
+        if logits_buffer is None or _is_npu or _is_cpu:
+            return False
+        if not logits_metadata.forward_mode.is_target_verify():
+            return False
+        if (
+            self.use_fp32_lm_head
+            or self.logit_scale is not None
+            or self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+            or embedding_bias is not None
+            or get_global_server_args().rl_on_policy_target is not None
+        ):
+            return False
+        if hasattr(lm_head, "set_lora") or not hasattr(lm_head, "weight"):
+            return False
+        if use_intel_amx_backend(lm_head):
+            return False
+        weight = lm_head.weight
+        return (
+            weight.dtype in (torch.bfloat16, torch.float16)
+            and hidden_states.dtype == weight.dtype
+            and hidden_states.ndim == 2
+            and weight.ndim == 2
+            and weight.shape[0] >= self.vocab_size
+            and logits_buffer.dtype == torch.float32
+            and logits_buffer.is_contiguous()
+            and tuple(logits_buffer.shape)
+            == (hidden_states.shape[0], self.vocab_size)
+        )
 
     def _compute_lm_head(
         self,
