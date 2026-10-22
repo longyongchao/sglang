@@ -384,15 +384,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _draft_logits_needed_for_verify(self) -> bool:
-        """Whether every decode step will have to re-run the draft head eagerly.
+        """Whether the verifier will need per-step draft logits (sampled draft).
 
-        With a sampled draft the verifier needs the per-step draft logits, and
-        the graph-folded head never produces them (see the need_draft_logits
-        gate in the decode path), so the proposal always falls back to eager.
-        The folded head would then be replayed and discarded on every step --
-        for Domino that is the whole rollout, roughly 0.85 ms per step at
-        block_size 16 -- so it is better not to capture it at all. The cost is
-        that a fully greedy batch served by a sampled drafter also stays eager.
+        The greedy DFLASH head fold never produces them (see the
+        need_draft_logits gate in the decode path), so its proposal would fall
+        back to eager and the folded head would be replayed and discarded on
+        every step; it is better not to capture it at all. Domino instead folds
+        its rejection-sampling rollout, which writes the logits in-graph.
         """
         draft_temp = self.server_args.speculative_draft_temperature
         return (
@@ -450,8 +448,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _eager("tp>1")
         if self.block_size <= 1:
             return _eager("block_size<=1")
-        if self._draft_logits_needed_for_verify():
-            return _eager("sampled draft needs eager per-step logits")
         target_model = self._target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not hasattr(lm_head, "weight"):
@@ -468,12 +464,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
+        # A sampled drafter folds the rejection-sampling rollout, which also
+        # leaves the verifier's q in the sampler's logits buffer.
+        draft_temperature = (
+            float(self.server_args.speculative_draft_temperature)
+            if self._draft_logits_needed_for_verify()
+            else 0.0
+        )
         return self._domino_rollout.build_capture_sampler(
             target_model=target_model,
             lm_head=lm_head,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
             capture_bs_list=self.server_args.cuda_graph_config.decode.bs,
+            draft_temperature=draft_temperature,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -1760,9 +1764,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._domino_sampler is not None
             and draft_out.can_run_graph
             and bs <= self._domino_sampler.max_bs
-            and not need_draft_logits
+            # A sampled fold only serves sampled batches; a fully greedy batch
+            # keeps the greedy eager rollout so its acceptance is unchanged.
+            and self._domino_sampler.sampled == need_draft_logits
         ):
             draft_next = self._domino_sampler.out[:bs]
+            if need_draft_logits:
+                draft_logits = self._domino_sampler.logits[:bs]
         elif (
             self._domino_rollout is None
             and self._draft_sampler is not None

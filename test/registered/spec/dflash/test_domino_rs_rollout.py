@@ -216,6 +216,7 @@ class TestDominoRSRolloutGraph(CustomTestCase):
             gru_input_table=table,
         )
         self.assertIsNotNone(entry, "capture 被 pool budget 拒绝了，测试形状选得太大")
+        entry["_rollout"] = rollout
         return state, table, entry
 
     def _inputs(self, seed):
@@ -311,6 +312,178 @@ class TestDominoRSRolloutGraph(CustomTestCase):
                 (probs.gather(1, out_a[:, k : k + 1]) > 0).all(),
                 f"slot {k} 抽到了零概率 token",
             )
+
+    def test_in_place_logits_match_graph(self):
+        """折进 draft graph 的采样 rollout 让 base_logits 与 logits_target 共用一块
+        存储：kernel 在同一个 program 里先读 base tile 再写回同一位置，结果必须和分开
+        两块 buffer 的 graph 路径逐位一致。"""
+        state, table, entry = self._capture(0.0, seed=81)
+        z_proj, base_logits, gru_h, slot_1 = self._inputs(82)
+        ref_out, ref_logits = self._replay(entry, z_proj, base_logits, gru_h, slot_1)
+
+        rollout = entry["_rollout"]
+        fc2_w, fc2_b = rollout._slice_domino_fc2(
+            state=state, start=0, length=self.V
+        )
+        num_v_blocks = (self.V + BLOCK_V - 1) // BLOCK_V
+        shared = base_logits.clone()
+        out = torch.empty(self.BS, self.ND, dtype=torch.long, device=DEVICE)
+        out[:, 0].copy_(slot_1)
+        sh = torch.empty(
+            self.BS, self.EMB + 3 * self.G, device=DEVICE, dtype=self.DTYPE
+        )
+        rollout._run_domino_rs_rollout_loop(
+            out_target=out,
+            logits_target=shared,
+            num_draft=self.ND,
+            org_vocab_start=0,
+            gru_h=gru_h.clone(),
+            z_proj=z_proj,
+            base_logits=shared,
+            w_sh_T=state["w_s_hh_T"],
+            sh_buf=sh,
+            s_proj_buf=sh[:, : self.EMB],
+            gh_buf=sh[:, self.EMB :],
+            h_new_buf=torch.empty_like(gru_h),
+            race_val_buf=torch.empty(
+                (self.BS, num_v_blocks), dtype=torch.float32, device=DEVICE
+            ),
+            race_idx_buf=torch.empty(
+                (self.BS, num_v_blocks), dtype=torch.int32, device=DEVICE
+            ),
+            local_tok_buf=torch.empty((self.BS,), dtype=torch.long, device=DEVICE),
+            exp_noise_buf=None,
+            inv_temperature=0.0,
+            fc2_w_shard=fc2_w,
+            fc2_b_shard=fc2_b,
+            b_hh_static=state["b_hh"],
+            gru_input_table=table,
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(shared, ref_logits))
+        self.assertTrue(torch.equal(out, ref_out))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required for Triton kernels")
+class TestDominoSampledDraftSampler(CustomTestCase):
+    """采样版 ``DominoDraftSampler`` 整条折进 cuda graph：抽到的 token 与写出的 q
+    必须自洽——拿抽中的 token 做 teacher forcing 重算每个 slot 的 logits，应当和
+    graph 写进 ``sampler.logits`` 的那份一致。"""
+
+    BS, ND, H, V, EMB, G = 3, 4, 64, 4096, 128, 96
+    DTYPE = torch.bfloat16
+
+    def _build(self, seed):
+        from sglang.srt.speculative.domino_rollout import (
+            DFlashDominoRollout,
+            DominoDraftSampler,
+        )
+
+        g = torch.Generator(device=DEVICE).manual_seed(seed)
+
+        def rand(*shape, scale=1.0):
+            return torch.randn(
+                *shape, generator=g, device=DEVICE, dtype=self.DTYPE
+            ).mul_(scale)
+
+        w_hh = rand(3 * self.G, self.G, scale=self.G**-0.5)
+        w_s = rand(self.EMB, self.G, scale=self.G**-0.5)
+        state = {
+            "w_z": rand(self.EMB, self.H, scale=self.H**-0.5),
+            "b1": rand(self.EMB, scale=0.1),
+            "gru_hidden_size": self.G,
+            "w_hh": w_hh,
+            "b_hh": rand(3 * self.G, scale=0.1),
+            "w_s_hh_T": torch.cat([w_s, w_hh], dim=0).T.contiguous(),
+            "fc2_weight": rand(self.V, self.EMB, scale=self.EMB**-0.5),
+            "fc2_bias": rand(self.V, scale=0.1),
+        }
+        rollout = DFlashDominoRollout(
+            domino_helper=None,
+            block_size=self.ND + 1,
+            target_vocab_size=self.V,
+            global_argmax_from_local_logits=None,
+            global_argmax_from_local_max=None,
+        )
+        sampler = DominoDraftSampler(
+            rollout=rollout,
+            weight=rand(self.V, self.H, scale=self.H**-0.5).mul_(4.0),
+            num_org=self.V,
+            org_vocab_start=0,
+            state=state,
+            gru_input_table=rand(self.V, 3 * self.G, scale=0.5),
+            candidate_pool_size=0,
+            shift_label=False,
+            max_bs=self.BS,
+            draft_temperature=1.0,
+        )
+        hidden = rand(self.BS * (self.ND + 1), self.H)
+        input_ids = torch.randint(
+            0, self.V, (self.BS * (self.ND + 1),), generator=g, device=DEVICE
+        )
+        return rollout, sampler, state, hidden, input_ids
+
+    def _teacher_forced_logits(self, rollout, sampler, state, hidden, input_ids, out):
+        z = hidden.view(self.BS, self.ND + 1, self.H)[:, 1:, :]
+        base = (z.reshape(-1, self.H) @ sampler.weight.T).view(
+            self.BS, self.ND, self.V
+        )
+        ref = base.clone()
+        bonus = input_ids.view(self.BS, self.ND + 1)[:, 0]
+        h = rollout._init_domino_prefix_gru_hidden(
+            prefix_ids=torch.stack([bonus, out[:, 0]], dim=1),
+            z_dtype=self.DTYPE,
+            device=DEVICE,
+            state=state,
+            full_gru_input_table=sampler.gru_input_table,
+        )
+        z_proj = torch.nn.functional.linear(z, state["w_z"], state["b1"])
+        for k in range(1, self.ND):
+            sh = h @ state["w_s_hh_T"]
+            mid = torch.nn.functional.silu(z_proj[:, k, :] + sh[:, : self.EMB])
+            bias = torch.nn.functional.linear(
+                mid, state["fc2_weight"], state["fc2_bias"]
+            )
+            ref[:, k, :] = (base[:, k, :].float() + bias.float()).to(self.DTYPE)
+            h = rollout._domino_manual_gru_step_from_projections(
+                gi=sampler.gru_input_table[out[:, k]],
+                gh=sh[:, self.EMB :],
+                gru_h=h,
+                state=state,
+            )
+        return ref
+
+    def test_graph_writes_consistent_q(self):
+        rollout, sampler, state, hidden, input_ids = self._build(91)
+        sampler(hidden, input_ids)  # warmup：填缓存、编译 triton
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sampler(hidden, input_ids)
+
+        draws = []
+        for _ in range(2):
+            graph.replay()
+            torch.cuda.synchronize()
+            out = sampler.out[: self.BS].clone()
+            logits = sampler.logits[: self.BS].clone()
+            draws.append(out)
+            ref = self._teacher_forced_logits(
+                rollout, sampler, state, hidden, input_ids, out
+            )
+            torch.testing.assert_close(
+                logits.float(), ref.float(), rtol=3e-2, atol=3e-2
+            )
+            for k in range(self.ND):
+                probs = torch.softmax(logits[:, k, :].float(), dim=-1)
+                self.assertTrue(
+                    (probs.gather(1, out[:, k : k + 1]) > 0).all(),
+                    f"slot {k} 抽到了零概率 token",
+                )
+        self.assertFalse(
+            torch.equal(draws[0], draws[1]),
+            "两次 replay 抽到同一串 token，说明噪声没有跟着 replay 重抽",
+        )
 
 
 if __name__ == "__main__":

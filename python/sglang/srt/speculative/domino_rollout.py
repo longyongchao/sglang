@@ -31,6 +31,10 @@ _DOMINO_TP_GRU_TABLE_CUSHION_MB = 1024
 # vocab] base-logits and logits buffers, so the pool is bounded explicitly
 # rather than growing with the number of distinct decode batch sizes.
 _DOMINO_RS_GRAPH_POOL_BUDGET_MB = 1024
+# The folded rejection-sampling rollout keeps one [max_bs, num_draft, vocab]
+# logits buffer shared by every captured batch size (the verifier reads q from
+# it after replay). Batch sizes beyond what fits stay on the eager rollout.
+_DOMINO_RS_FOLD_LOGITS_BUDGET_MB = 2048
 
 
 class DFlashDominoRollout:
@@ -1040,8 +1044,11 @@ class DFlashDominoRollout:
         costs one full-vocab pass plus the GRU cell.
         '''
 
-        # Slot 1 carries no GRU bias, so its logits are the base logits.
-        logits_target[:, 0, :].copy_(base_logits[:, 0, :])
+        # Slot 1 carries no GRU bias, so its logits are the base logits. The
+        # folded sampler passes the same storage for both (the fused kernel
+        # loads each base tile before storing the corrected tile in place).
+        if logits_target.data_ptr() != base_logits.data_ptr():
+            logits_target[:, 0, :].copy_(base_logits[:, 0, :])
         h_state = gru_h
         for k in range(1, num_draft):
             torch.matmul(h_state, w_sh_T, out=sh_buf)
@@ -1261,10 +1268,12 @@ class DFlashDominoRollout:
         num_org: int,
         org_vocab_start: int,
         capture_bs_list,
+        draft_temperature: float = 0.0,
     ) -> Optional["DominoDraftSampler"]:
         '''Build the tail hook that folds the whole rollout into the draft
         cuda graph. The caller checks fold eligibility (tp=1, dense lm_head,
-        no added vocab).'''
+        no added vocab). ``draft_temperature > 0`` folds the
+        rejection-sampling rollout, which also hands the verifier its q.'''
 
         num_draft = self.block_size - 1
         # The in-graph base_logits temporary dominates fold memory. It is
@@ -1281,13 +1290,40 @@ class DFlashDominoRollout:
             )
             return None
         fold_max_bs = max(capture_bs)
-        fold_logits_mib = (
-            fold_max_bs
-            * num_draft
+        row_mib = (
+            num_draft
             * int(num_org)
             * lm_head.weight.element_size()
             / (1024 * 1024)
         )
+        sampled = draft_temperature > 0
+        if sampled:
+            # The sampled fold's logits buffer is static (the verifier reads
+            # it after replay), so unlike the greedy temporary it is real
+            # memory held for the server's lifetime. Cap it; batch sizes
+            # beyond the cap keep the eager rollout.
+            fitting = [
+                b for b in capture_bs
+                if b * row_mib <= _DOMINO_RS_FOLD_LOGITS_BUDGET_MB
+            ]
+            if not fitting:
+                logger.warning(
+                    "[DFLASH Domino] sampled rollout fold disabled: even "
+                    "bs=%d needs %.0f MiB of draft logits (budget %d MiB).",
+                    min(capture_bs),
+                    min(capture_bs) * row_mib,
+                    _DOMINO_RS_FOLD_LOGITS_BUDGET_MB,
+                )
+                return None
+            if max(fitting) < fold_max_bs:
+                logger.warning(
+                    "[DFLASH Domino] sampled rollout fold capped at bs=%d "
+                    "(budget %d MiB); larger batch sizes run the eager rollout.",
+                    max(fitting),
+                    _DOMINO_RS_FOLD_LOGITS_BUDGET_MB,
+                )
+            fold_max_bs = max(fitting)
+        fold_logits_mib = fold_max_bs * row_mib
         state = self.domino_helper.get_rollout_state()
         embed_module = target_model.get_input_embeddings()
         gru_input_table = self.domino_helper.get_gru_input_proj_table(
@@ -1298,10 +1334,11 @@ class DFlashDominoRollout:
             warn_on_disable=True,
         )
         logger.info(
-            "[DFLASH Domino] rollout folded into the draft cuda graph "
+            "[DFLASH Domino] %s rollout folded into the draft cuda graph "
             "(fold_max_bs=%d, candidate_pool_size=%d, base_logits=%.0f MiB).",
+            "rejection-sampling" if sampled else "greedy",
             fold_max_bs,
-            candidate_pool_size,
+            candidate_pool_size if not sampled else 0,
             fold_logits_mib,
         )
         return DominoDraftSampler(
@@ -1316,6 +1353,7 @@ class DFlashDominoRollout:
                 getattr(self.domino_helper.draft_model, "shift_label", False)
             ),
             max_bs=fold_max_bs,
+            draft_temperature=float(draft_temperature),
         )
 
     def rollout_draft_block(
@@ -1605,6 +1643,12 @@ class DominoDraftSampler:
     into the draft graph, so the per-step eager prologue and the standalone
     loop-graph replay disappear. The worker reads `out` after replay.
     tp=1 / no-added-vocab only; other setups stay eager in the worker.
+
+    With ``draft_temperature > 0`` the sampler runs the rejection-sampling
+    rollout instead: every slot is drawn from softmax(logits / T) and the
+    per-slot logits the verifier needs as q land in `logits`. The base-logits
+    GEMM writes straight into `logits` and the fused kernel adds the GRU bias
+    in place, so there is no separate base-logits tensor or copy.
     '''
 
     def __init__(
@@ -1619,6 +1663,7 @@ class DominoDraftSampler:
         candidate_pool_size: int,
         shift_label: bool,
         max_bs: int,
+        draft_temperature: float = 0.0,
     ) -> None:
         self.rollout = rollout
         self.weight = weight
@@ -1633,10 +1678,17 @@ class DominoDraftSampler:
         self.max_bs = int(max_bs)
         self._warned_over_max_bs = False
         self.emb_dim = int(state["w_z"].shape[0])
+        self.draft_temperature = float(draft_temperature)
+        self.sampled = self.draft_temperature > 0
+        self.inv_temperature = (
+            1.0 / max(self.draft_temperature, 1e-5) if self.sampled else 0.0
+        )
+        # The sampled rollout scores the full vocab (the verifier needs the
+        # whole q row), so the candidate pool never applies to it.
         self.num_score_blocks = (
             (self.candidate_pool_size + _DOMINO_CANDIDATE_BLOCK_C - 1)
             // _DOMINO_CANDIDATE_BLOCK_C
-            if self.candidate_pool_size > 0
+            if self.candidate_pool_size > 0 and not self.sampled
             else (self.num_org + _DOMINO_BLOCK_V - 1) // _DOMINO_BLOCK_V
         )
         self.fc2_w_shard, self.fc2_b_shard = rollout._slice_domino_fc2(
@@ -1651,13 +1703,26 @@ class DominoDraftSampler:
             dtype=torch.int64,
             device=weight.device,
         )
+        # Per-slot draft logits (q for the verifier), sampled mode only. One
+        # buffer shared by every captured batch size; a step reads it right
+        # after its own replay, before the next draft step can overwrite it.
+        self.logits = (
+            torch.empty(
+                (self.max_bs, self.num_draft, self.num_org),
+                dtype=weight.dtype,
+                device=weight.device,
+            )
+            if self.sampled
+            else None
+        )
 
     def __call__(self, hidden_states: torch.Tensor, input_ids=None) -> None:
         bs = hidden_states.shape[0] // self.block_size
         if bs > self.max_bs:
-            # Should be unreachable: max_bs covers every captured batch size.
-            # Warn loudly because the worker silently runs the eager rollout
-            # here, which changes the measured draft latency.
+            # The greedy fold covers every captured batch size, so this is only
+            # reached when the sampled fold's logits buffer was capped. Warn
+            # because the worker runs the eager rollout for these batch sizes,
+            # which changes the measured draft latency.
             if not self._warned_over_max_bs:
                 self._warned_over_max_bs = True
                 logger.warning(
@@ -1679,13 +1744,23 @@ class DominoDraftSampler:
             z = hidden[:, 1:, :].contiguous()
         z_score = z.to(self.weight.dtype) if z.dtype != self.weight.dtype else z
 
-        base_logits = torch.matmul(
-            z_score.reshape(bs * num_draft, z_score.shape[-1]),
-            self.weight[: self.num_org].T,
-        ).view(bs, num_draft, self.num_org)
+        z_flat = z_score.reshape(bs * num_draft, z_score.shape[-1])
+        if self.sampled:
+            # In place: the fused kernel overwrites slot k of this buffer with
+            # base + GRU bias, so it ends up holding q for every slot.
+            base_logits = self.logits[:bs]
+            torch.matmul(
+                z_flat,
+                self.weight[: self.num_org].T,
+                out=base_logits.view(bs * num_draft, self.num_org),
+            )
+        else:
+            base_logits = torch.matmul(
+                z_flat, self.weight[: self.num_org].T
+            ).view(bs, num_draft, self.num_org)
 
         candidate_ids = None
-        if self.candidate_pool_size > 0:
+        if self.candidate_pool_size > 0 and not self.sampled:
             pool_source = (
                 base_logits[:, 1:, :] if num_draft > 1 else base_logits[:, :1, :]
             )
@@ -1694,9 +1769,14 @@ class DominoDraftSampler:
                 pool_logits, k=self.candidate_pool_size, dim=-1
             ).indices.contiguous()
 
-        slot_1 = (
-            torch.argmax(base_logits[:, 0, :], dim=-1) + self.org_vocab_start
-        ).to(torch.long)
+        if self.sampled:
+            slot_1_local = sample_dflash_draft_tokens(
+                logits=base_logits[:, 0, :],
+                draft_temperature=self.draft_temperature,
+            )
+        else:
+            slot_1_local = torch.argmax(base_logits[:, 0, :], dim=-1)
+        slot_1 = (slot_1_local + self.org_vocab_start).to(torch.long)
         bonus_tokens = input_ids.view(bs, self.block_size)[:bs, 0].to(torch.long)
 
         gru_h = rollout._init_domino_prefix_gru_hidden(
@@ -1726,6 +1806,33 @@ class DominoDraftSampler:
 
         out_slice = self.out[:bs]
         out_slice[:, 0].copy_(slot_1)
+        if self.sampled:
+            rollout._run_domino_rs_rollout_loop(
+                out_target=out_slice,
+                logits_target=base_logits,
+                num_draft=num_draft,
+                org_vocab_start=self.org_vocab_start,
+                gru_h=gru_h,
+                z_proj=z_proj,
+                base_logits=base_logits,
+                w_sh_T=state["w_s_hh_T"],
+                sh_buf=sh_buf,
+                s_proj_buf=sh_buf[:, : self.emb_dim],
+                gh_buf=sh_buf[:, self.emb_dim :],
+                h_new_buf=h_new_buf,
+                race_val_buf=argmax_val_buf,
+                race_idx_buf=argmax_idx_buf,
+                local_tok_buf=local_tok_buf,
+                exp_noise_buf=torch.empty(
+                    (bs, self.num_org), dtype=torch.float32, device=device
+                ),
+                inv_temperature=self.inv_temperature,
+                fc2_w_shard=self.fc2_w_shard,
+                fc2_b_shard=self.fc2_b_shard,
+                b_hh_static=state["b_hh"],
+                gru_input_table=self.gru_input_table,
+            )
+            return
         rollout._run_domino_rollout_loop(
             out_target=out_slice,
             num_draft=num_draft,
