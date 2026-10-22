@@ -12,7 +12,10 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockResult,
+    SampledDraftIO,
+)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -23,10 +26,12 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
+    ChainVerifyStaticBuffers,
     FinalizeAcceptLens,
     SelectMixedAccept,
     accept_greedy_triton,
     finalize_accept_lens_triton,
+    gated_accept_sampling_from_logits,
 )
 from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -37,6 +42,18 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window impor
     scatter_compact_to_strided_into,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+
+def sampled_accept_foldable(sampling_info) -> bool:
+    """Whether the epilogue's in-graph rejection sampling serves this batch:
+    every request samples, and p is plain ``softmax(l / T)`` (no top-k / top-p
+    truncation), matching the logits-only path of ``accept_draft_tokens``."""
+    return (
+        sampling_info is not None
+        and not sampling_info.is_any_greedy
+        and not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+    )
 
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
@@ -364,6 +381,7 @@ class TargetVerifyExecutor:
         device: str,
         sampling_info,
         inject_gate: bool = False,
+        sampled_temperatures: Optional[torch.Tensor] = None,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         ragged_window = BuildRaggedVerifyWindow.execute(
             batch=batch,
@@ -376,7 +394,11 @@ class TargetVerifyExecutor:
             model_runner=self.model_runner,
         )
         if self.verify_epilogue is not None:
-            self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)
+            self.verify_epilogue.begin_step(
+                layout.verify_lens,
+                armed=inject_gate,
+                sampled_temperatures=sampled_temperatures,
+            )
         target_verify = self._run_ragged(
             batch=batch,
             layout=layout,
@@ -440,6 +462,25 @@ class CommitInjectCtx(msgspec.Struct):
     resolve_req_to_token: object
 
 
+class SampledAcceptSpec(msgspec.Struct, frozen=True):
+    """Shape of the sampled draft fold whose q the epilogue verifies in-graph."""
+
+    # rows of the draft IO = largest draft graph bs running the sampled rollout
+    max_bs: int
+    vocab_size: int
+    logits_dtype: torch.dtype
+
+
+class _SampledAcceptBuffers(msgspec.Struct):
+    # shared with the draft sampler: q logits and draft temperatures
+    draft_io: SampledDraftIO
+    # staged before each target replay; padded rows keep earlier valid values
+    target_temperatures: torch.Tensor  # [max_bs] fp32
+    # 1: this replay verifies by rejection sampling; 0: greedy accept
+    gate: torch.Tensor  # [1] int32
+    chain: ChainVerifyStaticBuffers
+
+
 class AcceptOuts(msgspec.Struct):
     correct_len: torch.Tensor
     bonus: torch.Tensor
@@ -458,6 +499,7 @@ class DsparkVerifyEpilogue:
         verify_num_draft_tokens: int,
         device,
         commit_ctx: Optional[CommitInjectCtx] = None,
+        sampled_accept: Optional[SampledAcceptSpec] = None,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
@@ -488,6 +530,41 @@ class DsparkVerifyEpilogue:
         )
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
+        self._sampled: Optional[_SampledAcceptBuffers] = None
+        if sampled_accept is not None:
+            # Target graphs are captured before the draft sampler exists, so
+            # the epilogue owns the q storage and hands it to the sampler.
+            # Plain tensors: inputs are staged in place from the scheduler.
+            rows = min(int(sampled_accept.max_bs), self.max_bs)
+            with torch.inference_mode(False):
+                self._sampled = _SampledAcceptBuffers(
+                    draft_io=SampledDraftIO.allocate(
+                        max_bs=int(sampled_accept.max_bs),
+                        gamma=self.gamma,
+                        vocab_size=int(sampled_accept.vocab_size),
+                        dtype=sampled_accept.logits_dtype,
+                        device=device,
+                    ),
+                    target_temperatures=torch.ones(
+                        (rows,), dtype=torch.float32, device=device
+                    ),
+                    gate=torch.zeros((1,), dtype=torch.int32, device=device),
+                    chain=ChainVerifyStaticBuffers.allocate(
+                        max_bs=rows, slots=self.stride, device=device
+                    ),
+                )
+
+    @property
+    def sampled_draft_io(self) -> Optional[SampledDraftIO]:
+        return None if self._sampled is None else self._sampled.draft_io
+
+    def serves_sampled_accept(self, bs: int) -> bool:
+        """Whether a batch of ``bs`` real requests can be verified by the
+        in-graph rejection sampling (rows past the draft IO are padding)."""
+        return (
+            self._sampled is not None
+            and bs <= self._sampled.chain.accept_token_num.shape[0]
+        )
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -507,7 +584,25 @@ class DsparkVerifyEpilogue:
             bs=forward_batch.batch_size,
         )
 
-    def begin_step(self, verify_lens, armed: bool) -> None:
+    def begin_step(
+        self,
+        verify_lens,
+        armed: bool,
+        sampled_temperatures: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Stage this step's inputs before the target replay.
+
+        ``sampled_temperatures`` (per-request target temperatures) switches the
+        replay to rejection-sampling accept against the draft IO's q; without
+        it the replay accepts greedily."""
+        sampled = self._sampled
+        if sampled is not None:
+            if sampled_temperatures is None:
+                sampled.gate.zero_()
+            else:
+                n = sampled_temperatures.shape[0]
+                sampled.target_temperatures[:n].copy_(sampled_temperatures.view(-1))
+                sampled.gate.fill_(1)
         if verify_lens is None:
             self.verify_lens_buf.zero_()
         else:
@@ -607,6 +702,15 @@ class DsparkVerifyEpilogue:
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=verify_lens,
         )
+        if self._sampled is not None:
+            self._sampled_accept_into(
+                candidates=candidates.view(bs, self.stride),
+                verify_lens=verify_lens,
+                bs=bs,
+                correct_len=correct_len,
+                bonus=bonus,
+                cap_trim_lens=cap_trim_lens,
+            )
         finalized = finalize_accept_lens_triton(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,
@@ -626,6 +730,32 @@ class DsparkVerifyEpilogue:
         self.new_seq_lens_buf[:bs].copy_(finalized.new_seq_lens)
         self.out_tokens_buf[:bs].copy_(out_tokens.view(bs, self.stride))
         return finalized.commit_lens
+
+    def _sampled_accept_into(
+        self, *, candidates, verify_lens, bs: int, correct_len, bonus, cap_trim_lens
+    ) -> None:
+        """Overwrite the greedy accept with rejection sampling when the gate
+        is set. Only the first ``n`` rows are covered: a ragged graph may have
+        more slots than the draft IO, but those extra rows are padding."""
+        sampled = self._sampled
+        n = min(bs, sampled.chain.accept_token_num.shape[0])
+        stride = self.stride
+        s_len, s_bonus, s_trim = gated_accept_sampling_from_logits(
+            gate=sampled.gate,
+            candidates=candidates[:n],
+            target_logits=self.strided_logits[: n * stride],
+            target_temperatures=sampled.target_temperatures[:n],
+            draft_logits=sampled.draft_io.logits[:n],
+            draft_temperatures=sampled.draft_io.temperatures[:n],
+            verify_lens=verify_lens[:n],
+            buffers=sampled.chain,
+            greedy_len=correct_len[:n],
+            greedy_bonus=bonus[:n],
+            greedy_trim=cap_trim_lens[:n],
+        )
+        correct_len[:n].copy_(s_len)
+        bonus[:n].copy_(s_bonus)
+        cap_trim_lens[:n].copy_(s_trim)
 
     def _commit_inject(
         self, commit_lens, verify_lens, seq_lens, req_pool_indices, bs: int

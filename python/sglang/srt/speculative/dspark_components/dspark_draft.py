@@ -55,6 +55,9 @@ class DraftProposal(msgspec.Struct, frozen=True):
     confidence: Optional[torch.Tensor] = None
     confidence_tap: Optional[torch.Tensor] = None
     folded: bool = False
+    # The sampled rollout ran in the draft graph: draft tokens sit in the
+    # sampler's ``out`` and q in its static logits buffer for this step.
+    sampled_folded: bool = False
 
 
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
@@ -83,6 +86,34 @@ class _SampledFoldBuffers(msgspec.Struct):
     step_tokens: torch.Tensor  # [max_bs] int64
 
 
+class SampledDraftIO(msgspec.Struct, frozen=True):
+    """Externally owned outputs / staged inputs of the sampled draft fold.
+
+    The DSpark verify epilogue allocates these before the target graphs are
+    captured so that its in-graph rejection sampling can read q and the draft
+    temperatures from the same storage the draft graph writes.
+    """
+
+    logits: torch.Tensor  # [max_bs, gamma, V]
+    temperatures: torch.Tensor  # [max_bs] fp32
+    greedy_mask: torch.Tensor  # [max_bs] int32
+
+    @classmethod
+    def allocate(cls, *, max_bs: int, gamma: int, vocab_size: int, dtype, device):
+        return cls(
+            logits=torch.zeros((max_bs, gamma, vocab_size), dtype=dtype, device=device),
+            temperatures=torch.ones((max_bs,), dtype=torch.float32, device=device),
+            greedy_mask=torch.ones((max_bs,), dtype=torch.int32, device=device),
+        )
+
+    def fits(self, *, max_bs: int, gamma: int, vocab_size: int, dtype) -> bool:
+        return (
+            self.logits.shape[0] >= max_bs
+            and tuple(self.logits.shape[1:]) == (gamma, vocab_size)
+            and self.logits.dtype == dtype
+        )
+
+
 class DsparkDraftSampler:
     """Draft proposal run inside the draft cuda graph (capture tail hook).
 
@@ -103,6 +134,7 @@ class DsparkDraftSampler:
         confidence_fn=None,
         out=None,
         sampled_max_bs: Optional[int] = None,
+        sampled_io: Optional[SampledDraftIO] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -122,6 +154,8 @@ class DsparkDraftSampler:
         )
         self.sampled = sampled_max_bs is not None
         self.max_bs = int(sampled_max_bs) if self.sampled else int(max_bs)
+        # Whether the sampled buffers are the caller's ``sampled_io``.
+        self.shares_io = False
         # Set during capture when the base logits do not match the Markov head;
         # the proposal then keeps the eager sampled path.
         self._sampled_disabled = False
@@ -136,7 +170,9 @@ class DsparkDraftSampler:
             # under inference_mode cannot be updated in place outside it, and
             # inputs are staged from the scheduler, which may run either way.
             with torch.inference_mode(False):
-                self._sampled_buffers = self._build_sampled_buffers(device)
+                self._sampled_buffers = self._build_sampled_buffers(
+                    device, sampled_io
+                )
             self._fused_scratch = None
         else:
             self._sampled_buffers = None
@@ -145,7 +181,9 @@ class DsparkDraftSampler:
                 model=model, max_bs=max_bs, device=device
             )
 
-    def _build_sampled_buffers(self, device) -> _SampledFoldBuffers:
+    def _build_sampled_buffers(
+        self, device, sampled_io: Optional[SampledDraftIO]
+    ) -> _SampledFoldBuffers:
         from sglang.srt.speculative.dspark_components.kernels.dspark_markov_fused import (
             MARKOV_BLOCK_V,
         )
@@ -154,12 +192,24 @@ class DsparkDraftSampler:
         vocab_size, dtype = int(weight.shape[0]), weight.dtype
         num_v_blocks = (vocab_size + MARKOV_BLOCK_V - 1) // MARKOV_BLOCK_V
         max_bs = self.max_bs
+        self.shares_io = sampled_io is not None and sampled_io.fits(
+            max_bs=max_bs, gamma=self.gamma, vocab_size=vocab_size, dtype=dtype
+        )
+        io = (
+            sampled_io
+            if self.shares_io
+            else SampledDraftIO.allocate(
+                max_bs=max_bs,
+                gamma=self.gamma,
+                vocab_size=vocab_size,
+                dtype=dtype,
+                device=device,
+            )
+        )
         return _SampledFoldBuffers(
-            logits=torch.zeros(
-                (max_bs, self.gamma, vocab_size), dtype=dtype, device=device
-            ),
-            temperatures=torch.ones((max_bs,), dtype=torch.float32, device=device),
-            greedy_mask=torch.ones((max_bs,), dtype=torch.int32, device=device),
+            logits=io.logits[:max_bs],
+            temperatures=io.temperatures[:max_bs],
+            greedy_mask=io.greedy_mask[:max_bs],
             latent=torch.empty(
                 (max_bs, int(self.markov_head.markov_rank)), dtype=dtype, device=device
             ),
@@ -305,6 +355,7 @@ def maybe_build_draft_sampler(
     draft_temperature: Optional[float] = None,
     capture_bs=None,
     dp_moe_sync: bool = False,
+    sampled_io: Optional[SampledDraftIO] = None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or return None (with the reason
     logged) when the draft model cannot support folding and the proposal must
@@ -328,17 +379,12 @@ def maybe_build_draft_sampler(
 
     sampled_max_bs = None
     if draft_temperature is None or draft_temperature > 0:
-        sampled_reason = _sampled_fold_ineligible_reason(
-            draft_model=draft_model, dp_moe_sync=dp_moe_sync
+        sampled_max_bs, sampled_reason = plan_sampled_fold_max_bs(
+            draft_model=draft_model,
+            gamma=gamma,
+            capture_bs=capture_bs or [max_bs],
+            dp_moe_sync=dp_moe_sync,
         )
-        if sampled_reason is None:
-            sampled_max_bs = sampled_rollout_max_bs(
-                capture_bs=capture_bs or [max_bs],
-                gamma=gamma,
-                markov_head=draft_model.markov_head,
-            )
-            if sampled_max_bs is None:
-                sampled_reason = "no capture bs fits the static buffer budget"
         if sampled_reason is not None and draft_temperature is not None:
             # Every batch samples the draft and needs corrected logits, which
             # the greedy fold does not produce; capturing it anyway would
@@ -368,7 +414,29 @@ def maybe_build_draft_sampler(
         confidence_fn=confidence_fn,
         out=out,
         sampled_max_bs=sampled_max_bs,
+        sampled_io=sampled_io,
     )
+
+
+def plan_sampled_fold_max_bs(
+    *, draft_model, gamma: int, capture_bs, dp_moe_sync: bool
+) -> tuple[Optional[int], Optional[str]]:
+    """Largest draft graph bs the sampled fold covers, or (None, reason).
+
+    Pure check without allocations, shared by the draft sampler build and the
+    verify epilogue, which must size its buffers before the draft graphs exist.
+    """
+    reason = _sampled_fold_ineligible_reason(
+        draft_model=draft_model, dp_moe_sync=dp_moe_sync
+    )
+    if reason is not None:
+        return None, reason
+    max_bs = sampled_rollout_max_bs(
+        capture_bs=capture_bs, gamma=gamma, markov_head=draft_model.markov_head
+    )
+    if max_bs is None:
+        return None, "no capture bs fits the static buffer budget"
+    return max_bs, None
 
 
 def _sampled_fold_ineligible_reason(*, draft_model, dp_moe_sync: bool):
@@ -599,6 +667,7 @@ class DraftBlockProposer:
         folded_confidence = None
         confidence_tap = None
         folded = False
+        sampled_folded = False
         draft_block = None
         if (
             sampled_fold
@@ -610,6 +679,7 @@ class DraftBlockProposer:
             # buffer within this step. draft_tokens is cloned: observers read
             # it on side streams, and the next replay overwrites ``out``.
             # ``folded`` stays False, as it gates the greedy verify epilogue.
+            sampled_folded = True
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma]
                 .view(bs, self.gamma)
@@ -678,6 +748,7 @@ class DraftBlockProposer:
             confidence=folded_confidence,
             confidence_tap=confidence_tap,
             folded=folded,
+            sampled_folded=sampled_folded,
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:

@@ -31,6 +31,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
     make_next_draft_input,
     maybe_build_draft_sampler,
+    plan_sampled_fold_max_bs,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -51,7 +52,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
+    SampledAcceptSpec,
     TargetVerifyExecutor,
+    sampled_accept_foldable,
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
@@ -220,6 +223,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
                 ),
+                sampled_accept=self._plan_sampled_accept(server_args),
             )
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
@@ -269,6 +273,30 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._proposer.attach_segment_fn(
             self._observers.segment,
             profiling_active_fn=lambda: self._observers.profiling_active,
+        )
+
+    def _plan_sampled_accept(self, server_args) -> Optional[SampledAcceptSpec]:
+        """Size the epilogue's in-graph rejection sampling to the sampled draft
+        fold the draft sampler will build (same plan, before the draft graphs)."""
+        draft_temperature = server_args.speculative_draft_temperature
+        if draft_temperature is not None and draft_temperature <= 0:
+            return None
+        markov_head = getattr(self.draft_model, "markov_head", None)
+        if self.gamma <= 0 or markov_head is None:
+            return None
+        if not hasattr(self.draft_model, "compute_base_logits"):
+            return None
+        max_bs, _ = plan_sampled_fold_max_bs(
+            draft_model=self.draft_model,
+            gamma=self.gamma,
+            capture_bs=server_args.cuda_graph_config.decode.bs,
+            dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+        )
+        if max_bs is None:
+            return None
+        weight = markov_head.markov_w2.weight
+        return SampledAcceptSpec(
+            max_bs=max_bs, vocab_size=int(weight.shape[0]), logits_dtype=weight.dtype
         )
 
     def _resolve_target_embed_tokens(self, target_model):
@@ -376,6 +404,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_temperature=self.server_args.speculative_draft_temperature,
             capture_bs=self.server_args.cuda_graph_config.decode.bs,
             dp_moe_sync=self._draft_is_moe and self.server_args.enable_dp_attention,
+            sampled_io=(
+                self._verify_epilogue.sampled_draft_io
+                if self._verify_epilogue is not None
+                else None
+            ),
         )
 
     def clear_cache_pool(self):
@@ -609,9 +642,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
+        epilogue = self._verify_executor.verify_epilogue
+        # Sampled draft whose q sits in the epilogue's draft IO: the target
+        # graph also runs the rejection-sampling accept for all-sampled batches.
+        sampled_accept = (
+            epilogue is not None
+            and proposal.sampled_folded
+            and self._draft_sampler is not None
+            and self._draft_sampler.shares_io
+            and epilogue.serves_sampled_accept(bs)
+            and sampled_accept_foldable(sampling_info)
+        )
         fold_eligible = (
-            self._verify_executor.verify_epilogue is not None
-            and proposal.folded
+            epilogue is not None
+            and (proposal.folded or sampled_accept)
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
         )
@@ -626,6 +670,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     device=device,
                     sampling_info=sampling_info,
                     inject_gate=fold_eligible,
+                    sampled_temperatures=(
+                        sampling_info.temperatures
+                        if fold_eligible and sampled_accept
+                        else None
+                    ),
                 )
             else:
                 target_verify = self._verify_executor.run_non_compact(
@@ -639,7 +688,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
 
-        epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
         with self._observers.segment(InfoSegment.ACCEPT_BONUS):
             accept = self._verify_executor.accept_and_finalize(

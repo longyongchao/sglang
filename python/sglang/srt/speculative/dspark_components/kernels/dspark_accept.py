@@ -320,6 +320,131 @@ def accept_sampling_triton(
     return correct_len, bonus, cap_trim_lens
 
 
+class ChainVerifyStaticBuffers(msgspec.Struct):
+    """chain 拒绝采样在 cuda graph 内的静态输入/输出，按 ``max_bs`` 一次分配。"""
+
+    retrieve_index: torch.Tensor  # [max_bs, slots] int64, arange
+    predicts: torch.Tensor  # [max_bs * slots] int32
+    accept_index: torch.Tensor  # [max_bs, slots] int32
+    accept_token_num: torch.Tensor  # [max_bs] int32
+    # [max_bs * (slots + 1)] fp32：前 max_bs*slots 个是逐槽 coin，后 max_bs 个是末位采样 coin
+    coins: torch.Tensor
+
+    @classmethod
+    def allocate(cls, *, max_bs: int, slots: int, device) -> "ChainVerifyStaticBuffers":
+        return cls(
+            retrieve_index=torch.arange(
+                max_bs * slots, dtype=torch.int64, device=device
+            ).view(max_bs, slots),
+            predicts=torch.zeros((max_bs * slots,), dtype=torch.int32, device=device),
+            accept_index=torch.zeros((max_bs, slots), dtype=torch.int32, device=device),
+            accept_token_num=torch.zeros((max_bs,), dtype=torch.int32, device=device),
+            coins=torch.zeros((max_bs * (slots + 1),), dtype=torch.float32, device=device),
+        )
+
+
+@triton.jit
+def _select_sampled_accept_kernel(
+    gate_ptr,
+    accept_token_num_ptr,
+    accept_index_ptr,
+    predicts_ptr,
+    verify_lens_ptr,
+    greedy_len_ptr,
+    greedy_bonus_ptr,
+    greedy_trim_ptr,
+    out_len_ptr,
+    out_bonus_ptr,
+    out_trim_ptr,
+    cols,
+    n,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    if tl.load(gate_ptr) != 0:
+        cl = tl.load(accept_token_num_ptr + offs, mask=mask, other=0).to(tl.int64)
+        vl = tl.load(verify_lens_ptr + offs, mask=mask, other=0).to(tl.int64)
+        capped = tl.minimum(cl, vl - 1)
+        trim = cl - capped
+        # padding 行 verify_len=0 -> capped=-1；其 bonus 不会被读，按 0 列取避免越界
+        pos = tl.load(
+            accept_index_ptr + offs * cols + tl.maximum(capped, 0), mask=mask, other=0
+        ).to(tl.int64)
+        bonus = tl.load(predicts_ptr + pos, mask=mask, other=0).to(tl.int64)
+    else:
+        capped = tl.load(greedy_len_ptr + offs, mask=mask, other=0).to(tl.int64)
+        trim = tl.load(greedy_trim_ptr + offs, mask=mask, other=0).to(tl.int64)
+        bonus = tl.load(greedy_bonus_ptr + offs, mask=mask, other=0).to(tl.int64)
+    tl.store(out_len_ptr + offs, capped.to(out_len_ptr.dtype.element_ty), mask=mask)
+    tl.store(out_bonus_ptr + offs, bonus, mask=mask)
+    tl.store(out_trim_ptr + offs, trim.to(out_trim_ptr.dtype.element_ty), mask=mask)
+
+
+def gated_accept_sampling_from_logits(
+    *,
+    gate: torch.Tensor,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    target_temperatures: torch.Tensor,
+    draft_logits: torch.Tensor,
+    draft_temperatures: torch.Tensor,
+    verify_lens: torch.Tensor,
+    buffers: ChainVerifyStaticBuffers,
+    greedy_len: torch.Tensor,
+    greedy_bonus: torch.Tensor,
+    greedy_trim: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """cuda graph 内可按批次开关的 chain 拒绝采样 accept。
+
+    ``gate[0] != 0`` 时结果与 ``accept_sampling_triton``（p 由 target logits 按
+    ``softmax(l / T)`` 现算、q 由 draft logits 现算、按 ``verify_lens`` 截断）同分布；
+    否则 RS 相关 kernel 全部早退，直接返回传入的 greedy accept 结果。所有中间量
+    来自 ``buffers`` 或在图内消费，capture 安全；coin 每次 replay 重新抽取。
+    """
+    bs, slots = candidates.shape
+    max_bs = buffers.accept_token_num.shape[0]
+    assert bs <= max_bs and buffers.accept_index.shape[1] == slots
+    buffers.coins.uniform_()
+    uniform = buffers.coins[: bs * slots].view(bs, slots)
+    uniform_final = buffers.coins[max_bs * slots : max_bs * slots + bs]
+    chain_speculative_sampling_fused_triton(
+        predicts=buffers.predicts,
+        accept_index=buffers.accept_index[:bs],
+        accept_token_num=buffers.accept_token_num[:bs],
+        candidates=candidates,
+        retrive_index=buffers.retrieve_index[:bs],
+        uniform_samples=uniform,
+        uniform_samples_for_final_sampling=uniform_final,
+        target_logits=target_logits.view(bs, slots, -1),
+        target_temperature=target_temperatures,
+        draft_logits=draft_logits,
+        draft_temperature=draft_temperatures,
+        gate=gate,
+    )
+    out_len = torch.empty_like(greedy_len)
+    out_bonus = torch.empty((bs,), dtype=torch.int64, device=candidates.device)
+    out_trim = torch.empty_like(greedy_trim)
+    BLOCK = 256
+    _select_sampled_accept_kernel[(triton.cdiv(bs, BLOCK),)](
+        gate,
+        buffers.accept_token_num,
+        buffers.accept_index,
+        buffers.predicts,
+        verify_lens,
+        greedy_len,
+        greedy_bonus,
+        greedy_trim,
+        out_len,
+        out_bonus,
+        out_trim,
+        slots,
+        bs,
+        BLOCK=BLOCK,
+    )
+    return out_len, out_bonus, out_trim
+
+
 try:
     from flashinfer.sampling import softmax as _flashinfer_softmax
 except ImportError:

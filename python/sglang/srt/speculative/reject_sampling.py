@@ -15,10 +15,17 @@ def _row_lse_kernel(
     rows_per_b,
     n_cols,
     temperature,
+    Gate,
     BLOCK: tl.constexpr,
     PER_REQ_TEMP: tl.constexpr,
+    HAS_GATE: tl.constexpr = False,
 ):
-    """``Lse[b, s] = logsumexp(Logits[b, s, :] / T_b)``，fp32 累加，单趟在线算法。"""
+    """``Lse[b, s] = logsumexp(Logits[b, s, :] / T_b)``，fp32 累加，单趟在线算法。
+
+    ``HAS_GATE`` 时 ``Gate[0] == 0`` 直接返回（cuda graph 内按批次开关）。"""
+    if HAS_GATE:
+        if tl.load(Gate) == 0:
+            return
     row = tl.program_id(0)
     b = row // rows_per_b
     s = row % rows_per_b
@@ -133,6 +140,8 @@ def speculative_sampling_classic_kernel(
     q_vocab_start,
     q_vocab_len,
     num_q_rows,
+    # HAS_GATE 时 Gate[0] == 0 整个 kernel 直接返回，不写任何输出
+    Gate,
     # Constants
     NUM_SLOTS: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
@@ -141,7 +150,11 @@ def speculative_sampling_classic_kernel(
     P_PER_REQ_TEMP: tl.constexpr = False,
     Q_FROM_LOGITS: tl.constexpr = False,
     Q_PER_REQ_TEMP: tl.constexpr = False,
+    HAS_GATE: tl.constexpr = False,
 ):
+    if HAS_GATE:
+        if tl.load(Gate) == 0:
+            return
     pid = tl.program_id(0)
     cur_prob_row = 0
 
@@ -296,9 +309,14 @@ def _temperature_args(temperature: TemperatureArg, bs: int, dummy: torch.Tensor)
     return dummy, float(temperature), False
 
 
-def row_logsumexp(logits: torch.Tensor, temperature: TemperatureArg = 1.0):
+def row_logsumexp(
+    logits: torch.Tensor,
+    temperature: TemperatureArg = 1.0,
+    gate: Optional[torch.Tensor] = None,
+):
     """``logsumexp(logits / T, -1)``，``logits`` 为 ``[bs, rows, n]``，直接读原 dtype
-    不落 fp32 副本。``temperature`` 为标量或 per-request ``[bs]``。返回 ``[bs, rows]``。"""
+    不落 fp32 副本。``temperature`` 为标量或 per-request ``[bs]``。返回 ``[bs, rows]``。
+    ``gate`` 为 device 上的 int32 ``[1]``，为 0 时 kernel 不计算（输出未定义）。"""
     logits = _as_rows_last_contiguous(logits)
     bs, rows, n_cols = logits.shape
     lse = torch.empty((bs, rows), dtype=torch.float32, device=logits.device)
@@ -312,8 +330,10 @@ def row_logsumexp(logits: torch.Tensor, temperature: TemperatureArg = 1.0):
         rows,
         n_cols,
         temp_scalar,
+        lse if gate is None else gate,
         BLOCK=_BLOCK_V,
         PER_REQ_TEMP=per_req,
+        HAS_GATE=gate is not None,
     )
     return lse
 
@@ -334,6 +354,7 @@ def chain_speculative_sampling_fused_triton(
     draft_logits: Optional[torch.Tensor] = None,
     draft_vocab_start: int = 0,
     draft_temperature: TemperatureArg = 1.0,
+    gate: Optional[torch.Tensor] = None,
 ):
     """chain 拒绝采样；p、q 各自既可给稠密概率，也可给 logits 由 kernel 现算。
 
@@ -343,6 +364,8 @@ def chain_speculative_sampling_fused_triton(
       ``q[b, r, draft_vocab_start + j] = softmax(l[b, r] / T_draft)[j]``，区间外为 0；
       ``rows`` 不足 ``num_slots - 1`` 时缺的行按 q=0 处理。
     温度可为标量或 per-request ``[bs]`` 张量。
+    ``gate``（device 上 int32 ``[1]``）为 0 时所有 kernel 跳过、输出不写，供 cuda
+    graph 内按批次开关拒绝采样。
     """
     if (target_probs is None) == (target_logits is None):
         raise ValueError("exactly one of target_probs / target_logits is required")
@@ -355,7 +378,7 @@ def chain_speculative_sampling_fused_triton(
 
     p_from_logits = target_logits is not None
     if p_from_logits:
-        t_lse = row_logsumexp(p_src, target_temperature)
+        t_lse = row_logsumexp(p_src, target_temperature, gate)
         t_temps, t_temp, t_per_req = _temperature_args(target_temperature, batch_size, t_lse)
     else:
         t_lse, t_temps, t_temp, t_per_req = p_src, p_src, 1.0, False
@@ -366,7 +389,7 @@ def chain_speculative_sampling_fused_triton(
         q_vocab_len = max(
             0, min(draft_vocab_start + draft_vocab, vocab_size) - draft_vocab_start
         )
-        d_lse = row_logsumexp(q_src, draft_temperature)
+        d_lse = row_logsumexp(q_src, draft_temperature, gate)
         d_temps, d_temp, d_per_req = _temperature_args(draft_temperature, batch_size, d_lse)
     else:
         num_q_rows, q_vocab_len = 0, 0
@@ -407,6 +430,7 @@ def chain_speculative_sampling_fused_triton(
         int(draft_vocab_start),
         int(q_vocab_len),
         int(num_q_rows),
+        accept_token_num if gate is None else gate,
         NUM_SLOTS=num_slots,
         VOCAB_SIZE=vocab_size,
         BLOCK_V=_BLOCK_V,
@@ -414,6 +438,7 @@ def chain_speculative_sampling_fused_triton(
         P_PER_REQ_TEMP=t_per_req,
         Q_FROM_LOGITS=q_from_logits,
         Q_PER_REQ_TEMP=d_per_req,
+        HAS_GATE=gate is not None,
     )
 
 
