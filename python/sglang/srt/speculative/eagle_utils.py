@@ -456,45 +456,62 @@ def eagle_sample(
         )
 
         from sglang.srt.speculative.reject_sampling import (
-            chain_speculative_sampling_triton,
+            chain_speculative_sampling_fused_triton,
         )
 
         use_rejection_sampling = (
             get_global_server_args().speculative_use_rejection_sampling
         )
+        # 经典 chain RS 且批内无 top-k/top-p 截断时，p 由 kernel 按
+        # exp(l / T - lse) 从 logits 现算，省掉 temperature 除法与 softmax 各一份
+        # (bs * num_draft_tokens, vocab_size) fp32 的写出和读回。
+        target_from_logits = (
+            use_rejection_sampling
+            and not verify_input.use_eagle3_rejection_sampling
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_top_p_sampling
+        )
+        vocab_size = next_token_logits.shape[-1]
 
-        # Apply temperature and get target probs
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
-        )  # (bs * num_draft_tokens, 1)
+        if target_from_logits:
+            target_probs = None
+        else:
+            # Apply temperature and get target probs
+            expanded_temperature = torch.repeat_interleave(
+                sampling_info.temperatures, verify_input.draft_token_num, dim=0
+            )  # (bs * num_draft_tokens, 1)
 
-        target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        # top_k=TOP_K_ALL / top_p=1.0 让这两个 renorm 退化成恒等变换，但每个
-        # 仍要付一份 (bs * num_draft_tokens, vocab_size) fp32 分配加一趟读写。
-        # 标志位是保守的（merge_batch 用 |=，filter_batch 不动它），False 意味着
-        # 批内每个请求都没要求过滤，跳过是安全的。
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
+            target_probs = F.softmax(
+                next_token_logits / expanded_temperature, dim=-1
             )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
-            )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        target_probs = target_probs.reshape(
-            bs, verify_input.draft_token_num, -1
-        ).contiguous()
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+            # top_k=TOP_K_ALL / top_p=1.0 让这两个 renorm 退化成恒等变换，但每个
+            # 仍要付一份 (bs * num_draft_tokens, vocab_size) fp32 分配加一趟读写。
+            # 标志位是保守的（merge_batch 用 |=，filter_batch 不动它），False 意味着
+            # 批内每个请求都没要求过滤，跳过是安全的。
+            if sampling_info.need_top_k_sampling:
+                target_probs = top_k_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                    ),
+                )  # (bs * num_draft_tokens, vocab_size)
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_k_renorm"
+                )
+            if sampling_info.need_top_p_sampling:
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                    ),
+                )
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_p_renorm"
+                )
+            target_probs = target_probs.reshape(
+                bs, verify_input.draft_token_num, -1
+            ).contiguous()
         # One coin is consumed per tree node and one more for the bonus token.
         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
@@ -514,43 +531,49 @@ def eagle_sample(
                 target_probs=target_probs,
                 rejected_probs=torch.zeros_like(target_probs),
             )
-        else:
-            draft_probs = (
-                verify_input.draft_probs
-                if use_rejection_sampling
-                else torch.zeros_like(target_probs)
-            )
+        elif use_rejection_sampling:
+            draft_probs = verify_input.draft_probs
             # A reduced-vocab EAGLE3 draft keeps q draft-wide; the chain kernel
             # gathers it through draft_vocab_map instead of a full-vocab copy.
-            draft_vocab_map = (
-                verify_input.draft_vocab_map if use_rejection_sampling else None
-            )
+            draft_vocab_map = verify_input.draft_vocab_map
             # q must index the target vocab directly, or through the map.
-            if use_rejection_sampling and (
+            if (
                 draft_probs is None
                 or (
                     draft_probs.shape[-1]
                     if draft_vocab_map is None
                     else draft_vocab_map.shape[0]
                 )
-                != target_probs.shape[-1]
+                != vocab_size
             ):
                 raise ValueError(
                     "Rejection sampling requires a target-vocab draft proposal "
                     "distribution; the current speculative algorithm/draft worker "
                     "does not produce one (draft_probs missing or vocab-mismatched)."
                 )
-            extra_kwargs = (
-                {"draft_vocab_map": draft_vocab_map}
-                if draft_vocab_map is not None
-                else {}
+            if target_from_logits:
+                target_kwargs = dict(
+                    target_logits=next_token_logits.reshape(
+                        bs, verify_input.draft_token_num, vocab_size
+                    ),
+                    target_temperature=sampling_info.temperatures,
+                )
+            else:
+                target_kwargs = dict(target_probs=target_probs)
+            chain_speculative_sampling_fused_triton(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=candidates,
+                retrive_index=verify_input.retrieve_index,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                draft_probs=draft_probs,
+                draft_vocab_map=draft_vocab_map,
+                **target_kwargs,
             )
-            sampling_fn = (
-                chain_speculative_sampling_triton
-                if use_rejection_sampling
-                else tree_speculative_sampling_target_only
-            )
-            sampling_fn(
+        else:
+            tree_speculative_sampling_target_only(
                 predicts=predict,
                 accept_index=accept_index,
                 accept_token_num=num_correct_drafts,
@@ -561,11 +584,10 @@ def eagle_sample(
                 uniform_samples=coins,
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
-                draft_probs=draft_probs,
+                draft_probs=torch.zeros_like(target_probs),
                 threshold_single=get_global_server_args().speculative_accept_threshold_single,
                 threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
                 deterministic=True,
-                **extra_kwargs,
             )
 
         # Sync sampling results across TP ranks: different GPUs may
