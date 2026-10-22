@@ -238,6 +238,28 @@ class TestDFlareContextKV(CustomTestCase):
             self.assertEqual(call.args[5], attns[layer_idx].k_scale)
             self.assertEqual(call.args[6], attns[layer_idx].v_scale)
 
+    def test_fusion_probs_cache_tracks_weight_reload(self):
+        model = self.model
+        weights = model.layer_fusion_weights
+        original = weights.detach().clone()
+        try:
+            first = model._layer_fusion_probs()
+            self.assertIs(model._layer_fusion_probs(), first)
+            torch.testing.assert_close(first, torch.softmax(original, dim=1))
+            # Reload through the regular weight loader (param.data.copy_).
+            new_weights = torch.randn_like(original)
+            model.load_weights(iter([("layer_fusion_weights", new_weights)]))
+            torch.testing.assert_close(
+                model._layer_fusion_probs(), torch.softmax(new_weights, dim=1)
+            )
+            # Replacing the storage (as .to()/.cuda() does) also invalidates.
+            weights.data = original.clone()
+            torch.testing.assert_close(
+                model._layer_fusion_probs(), torch.softmax(original, dim=1)
+            )
+        finally:
+            model.load_weights(iter([("layer_fusion_weights", original)]))
+
     def test_model_structure(self):
         self.assertFalse(self.model.supports_fused_context_kv)
         self.assertTrue(self.model.supports_grouped_context_kv)

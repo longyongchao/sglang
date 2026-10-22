@@ -98,6 +98,22 @@ class DFlareDraftModel(DFlashDraftModel):
         self.layer_fusion_weights = nn.Parameter(
             torch.empty(num_layers, self.num_context_features)
         )
+        # softmax(layer_fusion_weights) 只随权重变化，推理每步复用同一份。
+        # load_weights 走 param.data.copy_（不 bump _version），故显式失效；
+        # .to()/.cuda() 会换 storage，用 data_ptr 兜住。
+        self._fusion_probs = None
+        self._fusion_probs_ptr = None
+
+    def load_weights(self, weights):
+        self._fusion_probs = None
+        return super().load_weights(weights)
+
+    def _layer_fusion_probs(self) -> torch.Tensor:
+        weights = self.layer_fusion_weights
+        if self._fusion_probs is None or self._fusion_probs_ptr != weights.data_ptr():
+            self._fusion_probs = torch.softmax(weights.detach(), dim=1)
+            self._fusion_probs_ptr = weights.data_ptr()
+        return self._fusion_probs
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Fuse concatenated target-layer hidden states per draft layer.
@@ -116,7 +132,7 @@ class DFlareDraftModel(DFlashDraftModel):
                 "the draft checkpoint/config expects."
             )
         stacked = target_hidden.view(-1, self.num_context_features, hidden_size)
-        fusion_probs = torch.softmax(self.layer_fusion_weights, dim=1)
+        fusion_probs = self._layer_fusion_probs()
         fused = torch.einsum("nth,dt->ndh", stacked, fusion_probs)
         return self.hidden_norm(fused)
 
