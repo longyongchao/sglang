@@ -607,35 +607,39 @@ class DSparkDraftMixin:
         cache_loc: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        fused_kv_helper=None,
     ) -> None:
+        """Write the target hidden states into every draft layer's KV cache.
+
+        With ``fused_kv_helper`` (a ``FusedKVMaterializeHelper``) all layers
+        share one K/V GEMM plus one fused k_norm+RoPE kernel; otherwise each
+        layer runs its own projection, norm and RoPE.
+        """
         ctx_hidden = self.project_target_hidden(target_hidden)
-        for layer in self.layers:
+        prefix_valid = cache_loc_2d is not None and commit_lens is not None
+
+        def write_layer_kv(layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
+            attn = self.layers[layer_idx].self_attn.attn
+            if prefix_valid:
+                pool.set_kv_buffer_prefix_valid(
+                    attn, cache_loc_2d, commit_lens, k, v, attn.k_scale, attn.v_scale
+                )
+            else:
+                pool.set_kv_buffer(attn, cache_loc, k, v, attn.k_scale, attn.v_scale)
+
+        if fused_kv_helper is not None:
+            fused_kv_helper.materialize(
+                ctx_hidden, positions, write_layer_kv=write_layer_kv
+            )
+            return
+        for layer_idx, layer in enumerate(self.layers):
             attn = layer.self_attn
             k, v = attn.kv_proj_only(ctx_hidden)
             k = attn.apply_k_norm(k)
             k = attn.apply_k_rope(positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            if cache_loc_2d is not None and commit_lens is not None:
-                pool.set_kv_buffer_prefix_valid(
-                    attn.attn,
-                    cache_loc_2d,
-                    commit_lens,
-                    k,
-                    v,
-                    attn.attn.k_scale,
-                    attn.attn.v_scale,
-                )
-            else:
-                pool.set_kv_buffer(
-                    attn.attn,
-                    cache_loc,
-                    k,
-                    v,
-                    attn.attn.k_scale,
-                    attn.attn.v_scale,
-                )
-
+            write_layer_kv(layer_idx, k, v)
 
 class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
 

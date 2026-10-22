@@ -1,13 +1,61 @@
-from typing import Optional
+import logging
+import math
+from typing import Optional, Tuple
 
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.speculative.dflash_utils import can_dflash_use_fused_qkv_proj
 from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
     BuildCommitInjectLayout,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+
+logger = logging.getLogger(__name__)
+
+
+def build_fused_kv_helper(
+    draft_model, *, device, max_position_hint: int
+) -> Tuple[Optional[object], str]:
+    """Build a ``FusedKVMaterializeHelper`` for a dense DSpark draft, or return
+    ``(None, reason)`` when a layer cannot use the fused path (quantized or
+    biased qkv_proj, non-unit KV scale, non-neox RoPE)."""
+    layers = getattr(draft_model, "layers", None)
+    if not layers:
+        return None, "no draft layers"
+    for layer_idx, layer in enumerate(layers):
+        attn = layer.self_attn
+        eligible, reason = can_dflash_use_fused_qkv_proj(
+            getattr(attn, "qkv_proj", None)
+        )
+        if not eligible:
+            return None, f"{reason}: layer={layer_idx}"
+        for name in ("k_scale", "v_scale"):
+            scale = getattr(attn.attn, name, None)
+            if scale is not None and not math.isclose(float(scale), 1.0):
+                return None, f"non-unit {name}={scale}: layer={layer_idx}"
+        if not getattr(attn.rotary_emb, "is_neox_style", True):
+            return None, f"non-neox RoPE: layer={layer_idx}"
+
+    from sglang.kernels.ops.speculative.fused_kv_materialize import (
+        FusedKVMaterializeHelper,
+    )
+
+    first_attn = layers[0].self_attn
+    try:
+        helper = FusedKVMaterializeHelper(
+            layers=layers,
+            rotary_emb=first_attn.rotary_emb,
+            num_kv_heads=first_attn.num_kv_heads,
+            head_dim=first_attn.head_dim,
+            device=device,
+            max_position_hint=max_position_hint,
+        )
+    except (ValueError, RuntimeError, NotImplementedError) as e:
+        return None, str(e)
+    return helper, ""
 
 
 class TargetHiddenKvInjector:
@@ -27,6 +75,17 @@ class TargetHiddenKvInjector:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
+        self._fused_kv_helper = None
+        pool = draft_model_runner.token_to_kv_pool
+        if not hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+            self._fused_kv_helper, reason = build_fused_kv_helper(
+                draft_model,
+                device=device,
+                max_position_hint=int(model_runner.model_config.context_len)
+                + int(verify_num_draft_tokens),
+            )
+            if self._fused_kv_helper is None:
+                logger.info("DSpark fused KV inject disabled: %s", reason)
 
     def inject_target_hidden(
         self,
@@ -67,15 +126,31 @@ class TargetHiddenKvInjector:
             )
             return
 
+        kwargs = dict(
+            target_hidden=target_hidden,
+            pool=pool,
+            positions=positions,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
         with torch.inference_mode():
-            self.draft_model.write_target_hidden_kv(
-                target_hidden=target_hidden,
-                pool=pool,
-                positions=positions,
-                cache_loc=cache_loc,
-                cache_loc_2d=cache_loc_2d,
-                commit_lens=commit_lens,
-            )
+            if self._fused_kv_helper is not None:
+                try:
+                    self.draft_model.write_target_hidden_kv(
+                        **kwargs, fused_kv_helper=self._fused_kv_helper
+                    )
+                    return
+                except Exception as e:
+                    # KV writes are idempotent, so the per-layer path can redo
+                    # whatever the fused path left half-written.
+                    logger.warning(
+                        "DSpark fused KV inject failed; falling back to the "
+                        "per-layer path: %s",
+                        e,
+                    )
+                    self._fused_kv_helper = None
+            self.draft_model.write_target_hidden_kv(**kwargs)
 
     def _inject_mla(
         self,
