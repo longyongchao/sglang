@@ -873,36 +873,6 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         use_sparse_topk=use_sparse_topk,
     )
 
-    vocab = target_probs.shape[-1]
-    if draft_logits is not None:
-        from sglang.srt.speculative.reject_sampling import (
-            chain_speculative_sampling_triton,
-        )
-
-        # draft_logits: [bs, block_size-1, draft_vocab] — per-draft-step logits
-        # Apply draft_temperature to match the actual sampling distribution q.
-        scaled_draft_logits = draft_logits.float()
-        if draft_temperature > 0 and draft_temperature != 1.0:
-            scaled_draft_logits = scaled_draft_logits / draft_temperature
-        draft_probs_partial = torch.softmax(scaled_draft_logits, dim=-1)
-        draft_vocab = draft_probs_partial.shape[-1]
-        num_draft = draft_probs_partial.shape[1]  # block_size - 1
-        # Build full draft_probs: [bs, draft_token_num, vocab]
-        # The kernel at step=k (k=1..block_size-1) reads draft_probs[cur_prob_row=k-1].
-        # So draft_probs[0..num_draft-1] must hold q for slot_1..slot_{num_draft}.
-        draft_probs = torch.zeros(
-            bs, draft_token_num, vocab, dtype=torch.float32, device=device
-        )
-        # Place draft probs at the correct positions (rows 0..num_draft-1)
-        # and correct global vocab offset.
-        end_idx = min(draft_vocab_start + draft_vocab, vocab)
-        src_len = end_idx - draft_vocab_start
-        draft_probs[:, :num_draft, draft_vocab_start:end_idx] = draft_probs_partial[:, :, :src_len]
-        sampling_fn = chain_speculative_sampling_triton
-    else:
-        draft_probs = torch.zeros_like(target_probs)
-        sampling_fn = tree_speculative_sampling_target_only
-
     (
         retrieve_index,
         retrieve_next_token,
@@ -918,22 +888,48 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     candidates_i64 = (
         candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
     )
-    sampling_fn(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
+    if draft_logits is not None:
+        from sglang.srt.speculative.reject_sampling import (
+            chain_speculative_sampling_from_draft_logits_triton,
+        )
+
+        # draft_logits: [bs, num_draft, draft_vocab]，第 r 行是 slot_{r+1} 的 q，
+        # 对应 kernel 在 step=r+1 读的 cur_prob_row=r。q 在 kernel 里按
+        # softmax(draft_logits / draft_temperature) 现算并平移到 draft_vocab_start，
+        # 不再落 [bs, draft_token_num, vocab] 的 fp32 稠密 q。
+        draft_inv_temperature = (
+            1.0 / draft_temperature if draft_temperature > 0 else 1.0
+        )
+        chain_speculative_sampling_from_draft_logits_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrive_index=retrieve_index,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs,
+            draft_logits=draft_logits,
+            draft_vocab_start=int(draft_vocab_start),
+            draft_inv_temperature=draft_inv_temperature,
+        )
+    else:
+        tree_speculative_sampling_target_only(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=torch.zeros_like(target_probs),
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=True,
+        )
 
     correct_len = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
