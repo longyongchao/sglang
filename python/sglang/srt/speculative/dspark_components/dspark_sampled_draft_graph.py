@@ -253,39 +253,117 @@ class SampledDraftGraphRunner:
     def _rollout(self, padded_bs: int) -> None:
         """The captured body: ``sample_draft_block``'s eager loop on static
         buffers, one fused scoring + sampling kernel per step."""
-        from sglang.srt.speculative.dspark_components.kernels.dspark_markov_fused import (
-            fused_markov_bias_sample,
+        buffers = self._buffers
+        logits = buffers.logits[:padded_bs]
+        sampled_markov_rollout(
+            embed_table=self._embed_table,
+            fc2_weight=self._fc2_weight,
+            base_logits=logits,
+            logits_out=logits,
+            anchor_tokens=buffers.anchor_tokens[:padded_bs],
+            temperatures=buffers.temperatures[:padded_bs],
+            greedy_mask=buffers.greedy_mask[:padded_bs],
+            latent=buffers.latent[:padded_bs],
+            exp_noise=buffers.exp_noise[:padded_bs],
+            out_val=buffers.out_val[:padded_bs],
+            out_idx=buffers.out_idx[:padded_bs],
+            step_tokens=buffers.step_tokens[:padded_bs],
+            draft_tokens=buffers.draft_tokens[:padded_bs],
         )
 
-        buffers = self._buffers
-        latent = buffers.latent[:padded_bs]
-        exp_noise = buffers.exp_noise[:padded_bs]
-        temperatures = buffers.temperatures[:padded_bs]
-        greedy_mask = buffers.greedy_mask[:padded_bs]
-        out_val = buffers.out_val[:padded_bs]
-        out_idx = buffers.out_idx[:padded_bs]
-        step_tokens = buffers.step_tokens[:padded_bs]
-        prev_tokens = buffers.anchor_tokens[:padded_bs]
-        for step_idx in range(self.gamma):
-            torch.index_select(self._embed_table, 0, prev_tokens, out=latent)
-            # Fresh Exp(1) noise per step, as the eager fast sampler draws it;
-            # inside the graph the Philox offset advances on every replay.
-            exp_noise.exponential_(1)
-            step_logits = buffers.logits[:padded_bs, step_idx, :]
-            fused_markov_bias_sample(
-                latent=latent,
-                fc2_weight=self._fc2_weight,
-                base_logits=step_logits,
-                logits_out=step_logits,
-                temperatures=temperatures,
-                greedy_mask=greedy_mask,
-                exp_noise=exp_noise,
-                out_val=out_val,
-                out_idx=out_idx,
-                final_token=step_tokens,
-            )
-            buffers.draft_tokens[:padded_bs, step_idx].copy_(step_tokens)
-            prev_tokens = step_tokens
+
+def sampled_markov_rollout(
+    *,
+    embed_table: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    base_logits: torch.Tensor,
+    logits_out: torch.Tensor,
+    anchor_tokens: torch.Tensor,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+    latent: torch.Tensor,
+    exp_noise: torch.Tensor,
+    out_val: torch.Tensor,
+    out_idx: torch.Tensor,
+    step_tokens: torch.Tensor,
+    draft_tokens: torch.Tensor,
+) -> None:
+    """Capture-safe sampled VanillaMarkov rollout over ``[B, gamma, V]`` base
+    logits: per step ``index_select`` + ``exponential_`` +
+    ``fused_markov_bias_sample``. Writes the corrected logits to ``logits_out``
+    (may alias ``base_logits``) and the drawn tokens to ``draft_tokens``."""
+    from sglang.srt.speculative.dspark_components.kernels.dspark_markov_fused import (
+        fused_markov_bias_sample,
+    )
+
+    prev_tokens = anchor_tokens
+    for step_idx in range(base_logits.shape[1]):
+        torch.index_select(embed_table, 0, prev_tokens, out=latent)
+        # Fresh Exp(1) noise per step, as the eager fast sampler draws it;
+        # inside a graph the Philox offset advances on every replay.
+        exp_noise.exponential_(1)
+        fused_markov_bias_sample(
+            latent=latent,
+            fc2_weight=fc2_weight,
+            base_logits=base_logits[:, step_idx, :],
+            logits_out=logits_out[:, step_idx, :],
+            temperatures=temperatures,
+            greedy_mask=greedy_mask,
+            exp_noise=exp_noise,
+            out_val=out_val,
+            out_idx=out_idx,
+            final_token=step_tokens,
+        )
+        draft_tokens[:, step_idx].copy_(step_tokens)
+        prev_tokens = step_tokens
+
+
+def sampled_rollout_ineligible_reason(*, draft_model, dp_moe_sync: bool) -> Optional[str]:
+    """Why the sampled Markov rollout cannot replay ``draft_model``'s eager
+    sampled draft (None when it can)."""
+    if dp_moe_sync:
+        return "dp moe sync"
+
+    from torch import nn
+
+    from sglang.srt.models.dspark import DSparkDraftMixin, VanillaMarkov
+
+    # The rollout replays VanillaMarkov.apply_step_logits on top of the dense
+    # compute_base_logits; subclasses (gated / rnn heads) and models with their
+    # own base logits (deepseek_v4_dspark) carry different math.
+    markov_head = getattr(draft_model, "markov_head", None)
+    if type(markov_head) is not VanillaMarkov:
+        return f"markov head {type(markov_head).__name__} is not vanilla"
+    compute_base_logits = getattr(type(draft_model), "compute_base_logits", None)
+    if compute_base_logits is not DSparkDraftMixin.compute_base_logits:
+        return "custom compute_base_logits"
+    w1, w2 = markov_head.markov_w1, markov_head.markov_w2
+    if type(w1) is not nn.Embedding or type(w2) is not nn.Linear or w2.bias is not None:
+        return "non-plain markov projections"
+    if w1.weight.dtype != w2.weight.dtype or w1.weight.device.type != "cuda":
+        return "markov weights dtype/device mismatch"
+    if w1.weight.shape[0] < w2.weight.shape[0]:
+        # index_select does not clamp out-of-range ids; every drafted id is
+        # < vocab_size, so the table must cover that range.
+        return "markov embedding narrower than vocab"
+    return None
+
+
+def sampled_rollout_max_bs(
+    *, capture_bs: Sequence[int], gamma: int, markov_head
+) -> Optional[int]:
+    """Largest capture batch size whose static rollout buffers fit the budget."""
+    per_request = SampledDraftGraphRunner.bytes_per_request(
+        gamma=gamma,
+        vocab_size=int(markov_head.markov_w2.weight.shape[0]),
+        markov_rank=int(markov_head.markov_rank),
+        dtype=markov_head.markov_w2.weight.dtype,
+    )
+    budget_bytes = _SAMPLED_DRAFT_GRAPH_BUDGET_MB * 1024 * 1024
+    fitting_bs = [
+        int(b) for b in capture_bs if 0 < int(b) * per_request <= budget_bytes
+    ]
+    return max(fitting_bs) if fitting_bs else None
 
 
 def maybe_build_sampled_draft_graph(
@@ -315,47 +393,26 @@ def maybe_build_sampled_draft_graph(
         return _eager("gamma<=0")
     if draft_temperature is not None and draft_temperature == 0:
         return _eager("deterministic draft never samples")
-    if dp_moe_sync:
-        return _eager("dp moe sync")
-
-    from torch import nn
-
-    from sglang.srt.models.dspark import DSparkDraftMixin, VanillaMarkov
-
-    # The graph replays VanillaMarkov.apply_step_logits on top of the dense
-    # compute_base_logits; subclasses (gated / rnn heads) and models with their
-    # own base logits (deepseek_v4_dspark) carry different math.
-    markov_head = getattr(draft_model, "markov_head", None)
-    if type(markov_head) is not VanillaMarkov:
-        return _eager(f"markov head {type(markov_head).__name__} is not vanilla")
-    compute_base_logits = getattr(type(draft_model), "compute_base_logits", None)
-    if compute_base_logits is not DSparkDraftMixin.compute_base_logits:
-        return _eager("custom compute_base_logits")
-    w1, w2 = markov_head.markov_w1, markov_head.markov_w2
-    if type(w1) is not nn.Embedding or type(w2) is not nn.Linear or w2.bias is not None:
-        return _eager("non-plain markov projections")
-    if w1.weight.dtype != w2.weight.dtype or w1.weight.device.type != "cuda":
-        return _eager("markov weights dtype/device mismatch")
-    vocab_size = int(w2.weight.shape[0])
-    if w1.weight.shape[0] < vocab_size:
-        # index_select does not clamp out-of-range ids; every drafted id is
-        # < vocab_size, so the table must cover that range.
-        return _eager("markov embedding narrower than vocab")
-
-    per_request = SampledDraftGraphRunner.bytes_per_request(
-        gamma=gamma,
-        vocab_size=vocab_size,
-        markov_rank=int(markov_head.markov_rank),
-        dtype=w2.weight.dtype,
+    reason = sampled_rollout_ineligible_reason(
+        draft_model=draft_model, dp_moe_sync=dp_moe_sync
     )
-    budget_bytes = _SAMPLED_DRAFT_GRAPH_BUDGET_MB * 1024 * 1024
-    fitting_bs = [
-        int(b) for b in capture_bs if 0 < int(b) * per_request <= budget_bytes
-    ]
-    if not fitting_bs:
+    if reason is not None:
+        return _eager(reason)
+
+    markov_head = draft_model.markov_head
+    max_bs = sampled_rollout_max_bs(
+        capture_bs=capture_bs, gamma=gamma, markov_head=markov_head
+    )
+    if max_bs is None:
         return _eager("no capture bs fits the static buffer budget")
-    max_bs = max(fitting_bs)
+    w2 = markov_head.markov_w2
     if tp_rank == 0:
+        per_request = SampledDraftGraphRunner.bytes_per_request(
+            gamma=gamma,
+            vocab_size=int(w2.weight.shape[0]),
+            markov_rank=int(markov_head.markov_rank),
+            dtype=w2.weight.dtype,
+        )
         logger.info(
             "DSpark sampled draft rollout will use cuda graphs for bs<=%d "
             "(%.1f MiB static buffers per request, %d MiB budget).",

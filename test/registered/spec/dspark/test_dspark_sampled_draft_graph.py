@@ -236,3 +236,148 @@ def test_builder_rejects_non_vanilla_heads():
         )
         is None
     )
+
+
+class _DenseDraft(torch.nn.Module):
+    """最小 draft：compute_base_logits 即稠密 lm_head GEMM。"""
+
+    def __init__(self, *, hidden_size, vocab_size, rank, dtype):
+        super().__init__()
+        self.lm_weight = torch.nn.Parameter(
+            torch.randn(vocab_size, hidden_size, device="cuda", dtype=dtype) * 0.2
+        )
+        self.markov_head = (
+            VanillaMarkov(vocab_size=vocab_size, markov_rank=rank).cuda().to(dtype)
+        )
+
+    def compute_base_logits(self, hidden):
+        return torch.matmul(hidden, self.lm_weight.detach().T), None
+
+
+def _capture_sampler_graph(sampler, *, graph_bs, gamma, hidden_size, dtype):
+    """模拟 draft cuda graph：tail hook 在 capture 内调用 sampler。"""
+    hidden = torch.zeros(graph_bs * gamma, hidden_size, device="cuda", dtype=dtype)
+    ids = torch.zeros(graph_bs * gamma, dtype=torch.long, device="cuda")
+    with torch.no_grad():
+        for _ in range(2):
+            sampler(hidden, ids)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sampler(hidden, ids)
+    return graph, hidden, ids
+
+
+def test_folded_sampled_draft_matches_rollout_and_varies():
+    """sampled 模式的 DsparkDraftSampler 在 graph 内完成 base GEMM + rollout：
+    q 与 token 一致、greedy 行取 argmax、padding 行不出 NaN、噪声随 replay 刷新。"""
+    from sglang.srt.speculative.dspark_components.dspark_draft import (
+        DsparkDraftSampler,
+    )
+
+    torch.manual_seed(13)
+    dtype = torch.bfloat16
+    hidden_size, vocab_size, rank, gamma = 64, 700, 16, 4
+    graph_bs, bs = 8, 6
+    model = _DenseDraft(
+        hidden_size=hidden_size, vocab_size=vocab_size, rank=rank, dtype=dtype
+    )
+    sampler = DsparkDraftSampler(
+        model=model, gamma=gamma, max_bs=16, device="cuda", sampled_max_bs=graph_bs
+    )
+    assert sampler.sampled and not sampler.serves_sampled(1)  # 尚未捕获
+    graph, hidden, ids = _capture_sampler_graph(
+        sampler, graph_bs=graph_bs, gamma=gamma, hidden_size=hidden_size, dtype=dtype
+    )
+    assert sampler.serves_sampled(bs) and not sampler.serves_sampled(graph_bs + 1)
+
+    greedy = torch.arange(bs, device="cuda") % 3 == 0
+    temperatures = torch.rand(bs, device="cuda").add_(0.5)
+    draws = []
+    for _ in range(4):
+        hidden[: bs * gamma].copy_(
+            torch.randn(bs * gamma, hidden_size, device="cuda", dtype=dtype)
+        )
+        anchor = torch.randint(0, vocab_size, (bs,), device="cuda")
+        ids.view(graph_bs, gamma)[:bs, 0].copy_(anchor)
+        sampler.stage_sampled_inputs(
+            temperatures=temperatures, greedy_mask=greedy.to(torch.int32)
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        tokens = sampler.out[: bs * gamma].view(bs, gamma).clone()
+        logits = sampler.sampled_logits(bs)
+        with torch.no_grad():
+            base, _ = model.compute_base_logits(hidden[: bs * gamma])
+        base = base.view(bs, gamma, vocab_size)
+        _assert_rollout_consistent(
+            model.markov_head, base, anchor, tokens, logits, greedy
+        )
+        padded = sampler._sampled_buffers.logits[bs:graph_bs]
+        assert torch.isfinite(padded.float()).all()
+        draws.append(tokens)
+    sampled = ~greedy
+    assert any(not torch.equal(draws[0][sampled], d[sampled]) for d in draws[1:])
+
+
+def test_folded_sampler_skips_graphs_beyond_budget():
+    """超出静态 buffer 预算的 graph 尺寸不跑 rollout，padding 到它的批次需走 eager。"""
+    from sglang.srt.speculative.dspark_components.dspark_draft import (
+        DsparkDraftSampler,
+    )
+
+    dtype = torch.bfloat16
+    hidden_size, vocab_size, rank, gamma = 32, 300, 8, 3
+    model = _DenseDraft(
+        hidden_size=hidden_size, vocab_size=vocab_size, rank=rank, dtype=dtype
+    )
+    out = torch.full((8 * gamma,), -7, dtype=torch.long, device="cuda")
+    sampler = DsparkDraftSampler(
+        model=model, gamma=gamma, max_bs=8, device="cuda", out=out, sampled_max_bs=4
+    )
+    for graph_bs in (2, 4, 8):
+        _capture_sampler_graph(
+            sampler, graph_bs=graph_bs, gamma=gamma, hidden_size=hidden_size,
+            dtype=dtype,
+        )  # fmt: skip
+    torch.cuda.synchronize()
+    assert sampler.serves_sampled(1) and sampler.serves_sampled(4)
+    assert not sampler.serves_sampled(5) and not sampler.serves_sampled(9)
+    # bs=8 的 graph 未写 out 的 [4*gamma:] 部分
+    assert torch.equal(out[4 * gamma :], torch.full_like(out[4 * gamma :], -7))
+
+
+def test_draft_sampler_builder_modes():
+    """dt>0 且可折叠 -> sampled 模式；dt>0 不可折叠 -> eager；dt=0 -> greedy 折叠。"""
+    from sglang.srt.models.dspark import DSparkDraftMixin
+    from sglang.srt.speculative.dspark_components.dspark_draft import (
+        maybe_build_draft_sampler,
+    )
+
+    class _Vanilla(DSparkDraftMixin):
+        def __init__(self):  # 跳过 mixin 的 config 解析
+            self.markov_head = (
+                VanillaMarkov(vocab_size=64, markov_rank=8).cuda().bfloat16()
+            )
+
+    class _Gated(DSparkDraftMixin):
+        def __init__(self):
+            self.markov_head = GatedMarkovHead(
+                vocab_size=64, markov_rank=8, hidden_size=16
+            ).cuda()
+
+    def build(model, dt):
+        return maybe_build_draft_sampler(
+            draft_model=model, gamma=4, max_bs=16, device="cuda", tp_rank=0,
+            draft_temperature=dt, capture_bs=[1, 2, 4, 8, 16],
+        )  # fmt: skip
+
+    for dt in (1.0, None):
+        sampler = build(_Vanilla(), dt)
+        assert sampler is not None and sampler.sampled and sampler.max_bs == 16
+    assert build(_Gated(), 1.0) is None
+    # 请求温度可能全 greedy：仍保留 greedy 折叠
+    sampler = build(_Gated(), None)
+    assert sampler is not None and not sampler.sampled
+    sampler = build(_Vanilla(), 0.0)
+    assert sampler is not None and not sampler.sampled

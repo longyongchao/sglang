@@ -20,6 +20,9 @@ from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.dspark_components.dspark_sampled_draft_graph import (
     SampledDraftGraphRunner,
+    sampled_markov_rollout,
+    sampled_rollout_ineligible_reason,
+    sampled_rollout_max_bs,
 )
 from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
     SampleStepTokens,
@@ -59,9 +62,48 @@ def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tenso
     return torch.argmax(step_logits, dim=-1)
 
 
-class DsparkDraftSampler:
+class _SampledFoldBuffers(msgspec.Struct):
+    """Static buffers of the sampled draft rollout folded into the draft graph.
 
-    def __init__(self, *, model, gamma, max_bs, device, confidence_fn=None, out=None):
+    Captured temporaries come from the graph mempool and are unreadable after
+    replay, so everything the verifier reads, and every per-request input
+    staged before replay, lives here.
+    """
+
+    # [max_bs, gamma, V] corrected logits (q for the verifier), written in-graph
+    logits: torch.Tensor
+    # staged before each replay; padded rows keep earlier valid values
+    temperatures: torch.Tensor  # [max_bs] fp32
+    greedy_mask: torch.Tensor  # [max_bs] int32
+    # scratch
+    latent: torch.Tensor  # [max_bs, R]
+    exp_noise: torch.Tensor  # [max_bs, V] fp32
+    out_val: torch.Tensor  # [max_bs, num_v_blocks] fp32
+    out_idx: torch.Tensor  # [max_bs, num_v_blocks] int32
+    step_tokens: torch.Tensor  # [max_bs] int64
+
+
+class DsparkDraftSampler:
+    """Draft proposal run inside the draft cuda graph (capture tail hook).
+
+    Greedy by default. In sampled mode (``sampled_max_bs`` given, draft
+    temperature > 0) it replays the fast-sampling VanillaMarkov rollout of
+    ``sample_draft_block`` in-graph and keeps the corrected logits in static
+    buffers for the rejection-sampling verifier, so the base-logits GEMM and
+    the gamma-step rollout no longer run outside the graph.
+    """
+
+    def __init__(
+        self,
+        *,
+        model,
+        gamma,
+        max_bs,
+        device,
+        confidence_fn=None,
+        out=None,
+        sampled_max_bs: Optional[int] = None,
+    ):
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
@@ -78,10 +120,77 @@ class DsparkDraftSampler:
             if confidence_fn is not None
             else None
         )
-        # Fused kernel scratch buffers
-        self._fused_scratch = self._try_build_scratch(
-            model=model, max_bs=max_bs, device=device
+        self.sampled = sampled_max_bs is not None
+        self.max_bs = int(sampled_max_bs) if self.sampled else int(max_bs)
+        # Set during capture when the base logits do not match the Markov head;
+        # the proposal then keeps the eager sampled path.
+        self._sampled_disabled = False
+        # captured draft graph bs -> whether its tail ran the sampled rollout
+        self._captured_bs: dict[int, bool] = {}
+        if self.sampled:
+            # detach(): same storage, but out= ops and kernel args must not
+            # see a requires_grad Parameter.
+            self._embed_table = self.markov_head.markov_w1.weight.detach()
+            self._fc2_weight = self.markov_head.markov_w2.weight.detach()
+            # Plain tensors regardless of the caller's grad mode: tensors made
+            # under inference_mode cannot be updated in place outside it, and
+            # inputs are staged from the scheduler, which may run either way.
+            with torch.inference_mode(False):
+                self._sampled_buffers = self._build_sampled_buffers(device)
+            self._fused_scratch = None
+        else:
+            self._sampled_buffers = None
+            # Fused kernel scratch buffers
+            self._fused_scratch = self._try_build_scratch(
+                model=model, max_bs=max_bs, device=device
+            )
+
+    def _build_sampled_buffers(self, device) -> _SampledFoldBuffers:
+        from sglang.srt.speculative.dspark_components.kernels.dspark_markov_fused import (
+            MARKOV_BLOCK_V,
         )
+
+        weight = self.markov_head.markov_w2.weight
+        vocab_size, dtype = int(weight.shape[0]), weight.dtype
+        num_v_blocks = (vocab_size + MARKOV_BLOCK_V - 1) // MARKOV_BLOCK_V
+        max_bs = self.max_bs
+        return _SampledFoldBuffers(
+            logits=torch.zeros(
+                (max_bs, self.gamma, vocab_size), dtype=dtype, device=device
+            ),
+            temperatures=torch.ones((max_bs,), dtype=torch.float32, device=device),
+            greedy_mask=torch.ones((max_bs,), dtype=torch.int32, device=device),
+            latent=torch.empty(
+                (max_bs, int(self.markov_head.markov_rank)), dtype=dtype, device=device
+            ),
+            exp_noise=torch.empty(
+                (max_bs, vocab_size), dtype=torch.float32, device=device
+            ),
+            out_val=torch.empty(
+                (max_bs, num_v_blocks), dtype=torch.float32, device=device
+            ),
+            out_idx=torch.empty((max_bs, num_v_blocks), dtype=torch.int32, device=device),
+            step_tokens=torch.zeros((max_bs,), dtype=torch.int64, device=device),
+        )
+
+    def serves_sampled(self, bs: int) -> bool:
+        """Whether the draft graph a batch of ``bs`` pads to (the smallest
+        captured size >= bs) ran the sampled rollout."""
+        if not self.sampled or self._sampled_disabled:
+            return False
+        padded = [b for b in self._captured_bs if b >= bs]
+        return bool(padded) and self._captured_bs[min(padded)]
+
+    def stage_sampled_inputs(
+        self, *, temperatures: torch.Tensor, greedy_mask: torch.Tensor
+    ) -> None:
+        """Copy this step's per-request inputs in before the draft replay."""
+        bs = temperatures.shape[0]
+        self._sampled_buffers.temperatures[:bs].copy_(temperatures)
+        self._sampled_buffers.greedy_mask[:bs].copy_(greedy_mask)
+
+    def sampled_logits(self, bs: int) -> torch.Tensor:
+        return self._sampled_buffers.logits[:bs]
 
     @staticmethod
     def _try_build_scratch(*, model, max_bs, device):
@@ -111,11 +220,51 @@ class DsparkDraftSampler:
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.gamma
+        if self.sampled:
+            # Called once per captured draft graph size; propose() looks up the
+            # graph a batch pads to before trusting the folded outputs.
+            serves = not self._sampled_disabled and bs <= self.max_bs
+            self._captured_bs[bs] = serves
+            if not serves:
+                return
         base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.gamma)[:, 0]
 
-        if (
+        if self.sampled:
+            buffers = self._sampled_buffers
+            if (
+                base_logits.shape[2] != buffers.logits.shape[2]
+                or base_logits.dtype != buffers.logits.dtype
+            ):
+                self._sampled_disabled = True
+                logger.warning(
+                    "DSpark sampled draft fold disabled: base logits %s/%s do "
+                    "not match the markov head; the sampled draft stays eager.",
+                    tuple(base_logits.shape),
+                    base_logits.dtype,
+                )
+                self._captured_bs[bs] = False
+                return
+            draft_tokens = self.out[: bs * self.gamma].view(bs, self.gamma)
+            # Padded rows read temperatures / greedy flags left by earlier
+            # steps (buffers start as ones), so they never produce NaN.
+            sampled_markov_rollout(
+                embed_table=self._embed_table,
+                fc2_weight=self._fc2_weight,
+                base_logits=base_logits,
+                logits_out=buffers.logits[:bs],
+                anchor_tokens=anchor,
+                temperatures=buffers.temperatures[:bs],
+                greedy_mask=buffers.greedy_mask[:bs],
+                latent=buffers.latent[:bs],
+                exp_noise=buffers.exp_noise[:bs],
+                out_val=buffers.out_val[:bs],
+                out_idx=buffers.out_idx[:bs],
+                step_tokens=buffers.step_tokens[:bs],
+                draft_tokens=draft_tokens,
+            )
+        elif (
             self._fused_scratch is not None
             and self.markov_head.markov_head_type in ("vanilla", "rnn")
         ):
@@ -132,7 +281,8 @@ class DsparkDraftSampler:
                 hidden_states=hidden_states.view(bs, self.gamma, -1),
                 sampler=greedy_step_sampler,
             )
-        self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
+        if not self.sampled:
+            self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
                 draft_hidden=hidden_states.view(bs, self.gamma, -1),
@@ -153,32 +303,63 @@ def maybe_build_draft_sampler(
     confidence_fn=None,
     out=None,
     draft_temperature: Optional[float] = None,
+    capture_bs=None,
+    dp_moe_sync: bool = False,
 ) -> Optional[DsparkDraftSampler]:
-    """Build the graph-folded greedy draft sampler, or return None (with the
-    reason logged) when the draft model cannot support folding and the
-    proposal must stay eager."""
+    """Build the graph-folded draft sampler, or return None (with the reason
+    logged) when the draft model cannot support folding and the proposal must
+    stay eager.
+
+    A draft that may sample (draft temperature None or > 0) gets the sampled
+    mode, which also produces the corrected logits rejection sampling needs;
+    a deterministic draft gets the greedy mode."""
 
     def _eager(reason):
         if tp_rank == 0:
-            logger.info("DSpark draft greedy proposal kept eager (reason=%s).", reason)
+            logger.info("DSpark draft proposal kept eager (reason=%s).", reason)
         return None
 
     if gamma <= 0:
         return _eager("gamma<=0")
-    if draft_temperature is not None and draft_temperature > 0:
-        # A sampled draft needs corrected_logits for rejection sampling, which
-        # the folded path does not produce, so propose() takes the eager branch
-        # for every non-greedy batch. Capturing the rollout anyway means
-        # replaying and discarding roughly 0.9 ms of graph work per decode step.
-        # The cost of skipping capture is that a fully greedy batch served by a
-        # sampled drafter also stays eager.
-        return _eager("sampled draft needs corrected logits")
     if not hasattr(draft_model, "compute_base_logits"):
         return _eager("no compute_base_logits")
     if getattr(draft_model, "markov_head", None) is None:
         return _eager("no markov head")
+
+    sampled_max_bs = None
+    if draft_temperature is None or draft_temperature > 0:
+        sampled_reason = _sampled_fold_ineligible_reason(
+            draft_model=draft_model, dp_moe_sync=dp_moe_sync
+        )
+        if sampled_reason is None:
+            sampled_max_bs = sampled_rollout_max_bs(
+                capture_bs=capture_bs or [max_bs],
+                gamma=gamma,
+                markov_head=draft_model.markov_head,
+            )
+            if sampled_max_bs is None:
+                sampled_reason = "no capture bs fits the static buffer budget"
+        if sampled_reason is not None and draft_temperature is not None:
+            # Every batch samples the draft and needs corrected logits, which
+            # the greedy fold does not produce; capturing it anyway would
+            # replay and discard the rollout on every decode step.
+            return _eager(f"sampled draft not foldable: {sampled_reason}")
+        if sampled_reason is not None and tp_rank == 0:
+            logger.info(
+                "DSpark sampled draft not folded (reason=%s); only fully greedy "
+                "batches use the folded draft.",
+                sampled_reason,
+            )
+
     if tp_rank == 0:
-        logger.info("DSpark draft greedy proposal folded into the draft cuda graph.")
+        if sampled_max_bs is not None:
+            logger.info(
+                "DSpark draft proposal folded into the draft cuda graph "
+                "(sampled rollout with corrected logits, bs<=%d).",
+                sampled_max_bs,
+            )
+        else:
+            logger.info("DSpark draft greedy proposal folded into the draft cuda graph.")
     return DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
@@ -186,6 +367,18 @@ def maybe_build_draft_sampler(
         device=device,
         confidence_fn=confidence_fn,
         out=out,
+        sampled_max_bs=sampled_max_bs,
+    )
+
+
+def _sampled_fold_ineligible_reason(*, draft_model, dp_moe_sync: bool):
+    if not envs.SGLANG_DSPARK_ENABLE_SAMPLED_DRAFT_GRAPH.get():
+        return "SGLANG_DSPARK_ENABLE_SAMPLED_DRAFT_GRAPH=0"
+    if not envs.SGLANG_DSPARK_FAST_SAMPLING.get():
+        # The folded rollout is the exponential-race sampler only.
+        return "SGLANG_DSPARK_FAST_SAMPLING=0"
+    return sampled_rollout_ineligible_reason(
+        draft_model=draft_model, dp_moe_sync=dp_moe_sync
     )
 
 
@@ -349,6 +542,19 @@ class DraftBlockProposer:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
 
+    def _resolve_draft_temperatures(self, *, bs, sampling_info, device):
+        """Same per-request draft temperatures as ``sample_draft_block``."""
+        if self._draft_temperature is not None:
+            return torch.full(
+                (bs,),
+                max(float(self._draft_temperature), 1e-5),
+                dtype=torch.float32,
+                device=device,
+            )
+        if sampling_info is None:
+            return torch.ones(bs, dtype=torch.float32, device=device)
+        return sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
+
     def propose(
         self,
         *,
@@ -362,6 +568,23 @@ class DraftBlockProposer:
     ) -> DraftProposal:
         embed_module = target_model.get_input_embeddings()
         _seg = self._segment_fn
+        draft_sampler = self._draft_sampler
+        deterministic_draft = self._draft_temperature == 0
+        requests_all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        all_greedy = deterministic_draft or requests_all_greedy
+        # Sampled mode: the draft graph tail runs the sampled rollout on inputs
+        # staged now, before the replay inside _run_forward.
+        sampled_fold = draft_sampler is not None and draft_sampler.serves_sampled(bs)
+        if sampled_fold:
+            temperatures = self._resolve_draft_temperatures(
+                bs=bs, sampling_info=sampling_info, device=device
+            )
+            greedy_mask = resolve_greedy_mask(
+                bs=bs, sampling_info=sampling_info, device=device
+            )
+            draft_sampler.stage_sampled_inputs(
+                temperatures=temperatures, greedy_mask=greedy_mask.to(torch.int32)
+            )
         with _seg("draft_backbone") if _seg else nullcontext():
             fwd = self._run_forward(
                 batch=batch,
@@ -373,14 +596,37 @@ class DraftBlockProposer:
             )
         draft_block_ids = fwd.draft_block_ids
 
-        draft_sampler = self._draft_sampler
-        deterministic_draft = self._draft_temperature == 0
-        requests_all_greedy = sampling_info is None or sampling_info.is_all_greedy
-        all_greedy = deterministic_draft or requests_all_greedy
         folded_confidence = None
         confidence_tap = None
         folded = False
-        if draft_sampler is not None and fwd.can_run_graph and all_greedy:
+        draft_block = None
+        if (
+            sampled_fold
+            and fwd.can_run_graph
+            and not requests_all_greedy
+            and not deterministic_draft
+        ):
+            # The rejection-sampling verifier reads q from the static logits
+            # buffer within this step. draft_tokens is cloned: observers read
+            # it on side streams, and the next replay overwrites ``out``.
+            # ``folded`` stays False, as it gates the greedy verify epilogue.
+            draft_block = DraftBlockResult(
+                draft_tokens=draft_sampler.out[: bs * self.gamma]
+                .view(bs, self.gamma)
+                .clone(),
+                corrected_logits=draft_sampler.sampled_logits(bs),
+                greedy_mask=greedy_mask,
+                temperatures=temperatures,
+                deterministic_draft=False,
+            )
+            if draft_sampler.confidence_out is not None:
+                folded_confidence = draft_sampler.confidence_out[:bs]
+        elif (
+            draft_sampler is not None
+            and fwd.can_run_graph
+            and all_greedy
+            and (sampled_fold or not draft_sampler.sampled)
+        ):
             # Fold (skip corrected_logits) when either:
             # 1. All requests are greedy (no rejection sampling needed), OR
             # 2. Draft is deterministic (draft_temp=0): verification uses
@@ -388,21 +634,9 @@ class DraftBlockProposer:
             #    so corrected_logits are not needed regardless of target temp.
             if requests_all_greedy or deterministic_draft:
                 folded = True
-                if self._draft_temperature is not None:
-                    temperatures = torch.full(
-                        (bs,),
-                        max(float(self._draft_temperature), 1e-5),
-                        dtype=torch.float32,
-                        device=device,
-                    )
-                elif sampling_info is None:
-                    temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-                else:
-                    temperatures = (
-                        sampling_info.temperatures.view(-1)
-                        .to(torch.float32)
-                        .clamp_min(1e-5)
-                    )
+                temperatures = self._resolve_draft_temperatures(
+                    bs=bs, sampling_info=sampling_info, device=device
+                )
                 draft_block = DraftBlockResult(
                     draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
                     corrected_logits=None,
@@ -418,7 +652,7 @@ class DraftBlockProposer:
                 )
                 if draft_sampler.confidence_out is not None:
                     folded_confidence = draft_sampler.confidence_out[:bs]
-        if not folded:
+        if draft_block is None:
             with self._base_logits_context(), (
                 _seg("draft_base_logits") if _seg else nullcontext()
             ):

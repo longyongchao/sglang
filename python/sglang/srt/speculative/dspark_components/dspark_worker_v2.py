@@ -374,6 +374,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 else None
             ),
             draft_temperature=self.server_args.speculative_draft_temperature,
+            capture_bs=self.server_args.cuda_graph_config.decode.bs,
+            dp_moe_sync=self._draft_is_moe and self.server_args.enable_dp_attention,
         )
 
     def clear_cache_pool(self):
