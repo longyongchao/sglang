@@ -54,6 +54,10 @@ _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
+# The sampled draft head keeps one [max_bs * num_draft, vocab] logits buffer
+# for the verifier; batch sizes beyond what fits keep the eager head.
+_DFLASH_SAMPLED_HEAD_LOGITS_BUDGET_MB = 2048
+
 _FusedKVMaterializeHelper = None
 _DFlareGroupedKVMaterializeHelper = None
 
@@ -79,28 +83,61 @@ def _get_fused_kv_materialize_helper(*, grouped_context_kv: bool = False):
 
 
 class _DflashDraftSampler:
-    """Capture-safe greedy argmax over the target LM head, run inside the draft
+    """Capture-safe draft head over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
     DFLASH's draft has no head of its own; it borrows the target `lm_head`.
     tp=1 / no-added-vocab only; TP>1 stays eager in the worker.
+
+    Greedy by default. With ``draft_temperature > 0`` every draft position is
+    drawn from softmax(logits / T) and the logits are kept in `logits`, which
+    the rejection-sampling verifier reads as q after replay.
     """
 
-    def __init__(self, *, weight, block_size, num_org, org_vocab_start, max_bs, anchor_prediction=False):
+    def __init__(
+        self,
+        *,
+        weight,
+        block_size,
+        num_org,
+        org_vocab_start,
+        max_bs,
+        anchor_prediction=False,
+        draft_temperature=0.0,
+    ):
         self.weight = weight
         self.block_size = int(block_size)
         self.num_org = int(num_org)
         self.org_vocab_start = int(org_vocab_start)
         self.anchor_prediction = anchor_prediction
         self._num_draft = self.block_size if anchor_prediction else self.block_size - 1
+        self.max_bs = int(max_bs)
+        self.draft_temperature = float(draft_temperature)
+        self.sampled = self.draft_temperature > 0
         # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty(
-            (int(max_bs) * self._num_draft,),
+            (self.max_bs * self._num_draft,),
             dtype=torch.int64,
             device=weight.device,
+        )
+        # Sampled mode only: q for the verifier. Static (unlike the greedy
+        # in-graph temporary) because it is read after replay; one buffer is
+        # shared by every captured batch size.
+        self.logits = (
+            torch.empty(
+                (self.max_bs * self._num_draft, self.num_org),
+                dtype=weight.dtype,
+                device=weight.device,
+            )
+            if self.sampled
+            else None
         )
 
     def __call__(self, hidden_states, input_ids=None):
         bs = hidden_states.shape[0] // self.block_size
+        if bs > self.max_bs:
+            # Only reachable when the sampled logits buffer was capped; the
+            # worker runs the eager head for these batch sizes.
+            return
         if self.anchor_prediction:
             # All block_size positions produce predictions (shifted labels)
             hs = hidden_states.view(bs, self.block_size, -1).reshape(
@@ -113,8 +150,15 @@ class _DflashDraftSampler:
             )
         if hs.dtype != self.weight.dtype:
             hs = hs.to(self.weight.dtype)
-        logits = torch.matmul(hs, self.weight[: self.num_org].T)
-        tokens = torch.argmax(logits, dim=-1).to(torch.long)
+        if self.sampled:
+            logits = self.logits[: hs.shape[0]]
+            torch.matmul(hs, self.weight[: self.num_org].T, out=logits)
+            tokens = sample_dflash_draft_tokens(
+                logits=logits, draft_temperature=self.draft_temperature
+            ).to(torch.long)
+        else:
+            logits = torch.matmul(hs, self.weight[: self.num_org].T)
+            tokens = torch.argmax(logits, dim=-1).to(torch.long)
         if self.org_vocab_start:
             tokens += self.org_vocab_start
         self.out[: tokens.shape[0]].copy_(tokens)
@@ -386,11 +430,8 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _draft_logits_needed_for_verify(self) -> bool:
         """Whether the verifier will need per-step draft logits (sampled draft).
 
-        The greedy DFLASH head fold never produces them (see the
-        need_draft_logits gate in the decode path), so its proposal would fall
-        back to eager and the folded head would be replayed and discarded on
-        every step; it is better not to capture it at all. Domino instead folds
-        its rejection-sampling rollout, which writes the logits in-graph.
+        Both folds then switch to their sampled variant, which writes the
+        logits in-graph for the verifier to read as q.
         """
         draft_temp = self.server_args.speculative_draft_temperature
         return (
@@ -402,15 +443,14 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
             if self.tp_rank == 0:
-                logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
+                logger.info("DFLASH draft head kept eager (reason=%s).", reason)
             return None
 
         if get_tp_group().world_size != 1:
             return _eager("tp>1")
         if self.block_size <= 1:
             return _eager("block_size<=1")
-        if self._draft_logits_needed_for_verify():
-            return _eager("sampled draft needs eager per-step logits")
+        sampled = self._draft_logits_needed_for_verify()
         target_model = self._target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not hasattr(lm_head, "weight"):
@@ -419,6 +459,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
         if not hasattr(lm_head, "shard_indices"):
+            if sampled:
+                # The eager head returns no logits for such a head either.
+                return _eager("sampled draft needs a sharded lm_head")
             num_org = int(lm_head.weight.shape[0])
             org_vocab_start = 0
         else:
@@ -427,15 +470,46 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
+        capture_bs = [int(b) for b in self.server_args.cuda_graph_config.decode.bs]
+        max_bs = max(capture_bs)
+        draft_temperature = 0.0
+        if sampled:
+            draft_temperature = float(self.server_args.speculative_draft_temperature)
+            row_mib = (
+                self._num_draft_tokens
+                * num_org
+                * lm_head.weight.element_size()
+                / (1024 * 1024)
+            )
+            fitting = [
+                b for b in capture_bs
+                if b * row_mib <= _DFLASH_SAMPLED_HEAD_LOGITS_BUDGET_MB
+            ]
+            if not fitting:
+                return _eager("sampled draft logits exceed the buffer budget")
+            if max(fitting) < max_bs and self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH sampled draft head fold capped at bs=%d (budget %d "
+                    "MiB); larger batch sizes run the eager head.",
+                    max(fitting),
+                    _DFLASH_SAMPLED_HEAD_LOGITS_BUDGET_MB,
+                )
+            max_bs = max(fitting)
         if self.tp_rank == 0:
-            logger.info("DFLASH draft greedy head folded into the draft cuda graph.")
+            logger.info(
+                "DFLASH draft %s head folded into the draft cuda graph "
+                "(fold_max_bs=%d).",
+                "sampled" if sampled else "greedy",
+                max_bs,
+            )
         return _DflashDraftSampler(
             weight=lm_head.weight,
             block_size=self.block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
-            max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+            max_bs=max_bs,
             anchor_prediction=self._anchor_prediction,
+            draft_temperature=draft_temperature,
         )
 
     def _maybe_build_domino_sampler(self):
@@ -1775,11 +1849,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._domino_rollout is None
             and self._draft_sampler is not None
             and draft_out.can_run_graph
-            and not need_draft_logits
+            and bs <= self._draft_sampler.max_bs
+            # Same rule as Domino: the sampled fold only serves sampled batches.
+            and self._draft_sampler.sampled == need_draft_logits
         ):
             draft_next = self._draft_sampler.out[
                 : bs * self._num_draft_tokens
             ].view(bs, self._num_draft_tokens)
+            if need_draft_logits:
+                draft_logits = self._draft_sampler.logits[
+                    : bs * self._num_draft_tokens
+                ].view(bs, self._num_draft_tokens, -1)
         else:
             with self._observers.segment("draft_sampling"):
                 draft_hidden = draft_logits_output.hidden_states
