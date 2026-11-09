@@ -33,7 +33,7 @@ try:
 except ImportError:
     _HAS_FLASHINFER = False
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 
 class _TargetVerifyMode:
